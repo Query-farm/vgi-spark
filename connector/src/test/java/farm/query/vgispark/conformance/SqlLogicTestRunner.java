@@ -97,16 +97,21 @@ final class SqlLogicTestRunner {
                         try {
                             spark.sql(sparkSql).collect();
                             failures.add("expected an error for:\n" + sparkSql);
-                        } catch (RuntimeException e) {
+                        } catch (Exception e) {
                             // A DuckDB-specific error-message substring isn't
                             // expected to match Spark's own wording — the
                             // meaningful assertion here is just "it failed".
+                            // Exception, not RuntimeException: Spark's own
+                            // AnalysisException (unresolved routine/column,
+                            // parse errors, ...) is a CHECKED exception — a
+                            // narrower catch here lets one such failure
+                            // escape uncaught instead of being recorded.
                             executed++;
                         }
                     }
                     default -> { }
                 }
-            } catch (RuntimeException e) {
+            } catch (Exception e) {
                 failures.add("unexpected failure for:\n" + sparkSql + "\n" + e);
             }
         }

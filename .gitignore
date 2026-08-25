@@ -5,3 +5,6 @@ build/
 *.iml
 out/
 .DS_Store
+# Spark's own scratch warehouse dir, created by CREATE TABLE statements
+# the sqllogictest sweep attempts against spark_catalog (not this connector).
+spark-warehouse/
