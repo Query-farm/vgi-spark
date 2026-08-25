@@ -131,19 +131,27 @@ public final class VgiScanBuilder implements ScanBuilder,
      * The wire (base-schema) names of the columns this scan actually
      * projects, in schema order — what {@code table_function_plan}'s {@code
      * projection_ids} names and what {@link VgiFilterTranslator} roots a
-     * filter's column index against. {@code null} {@link #prunedSchema}
-     * (pruneColumns was never called — e.g. a {@code SELECT *}) means every
-     * column.
+     * filter's column index against. {@code null} {@link #projectionIds}
+     * (either {@link #prunedSchema} was never set — e.g. a {@code SELECT *}
+     * — or every requested column got pruned away, e.g. a bare {@code
+     * count(*)} with no {@code WHERE} clause at all: {@code
+     * projectionIds()}'s own "empty means no restriction" contract) means
+     * every column. A prior version of this method checked only {@code
+     * prunedSchema == null} and NPE'd on the second case — {@code
+     * SELECT count(*) FROM t TIMESTAMP AS OF '...'} is exactly that shape
+     * (no projected columns AND no filter to reference any), first caught by
+     * a time-travel regression test though the bug has nothing to do with
+     * time travel itself.
      */
     private List<String> projectedWireNames() {
         Schema arrow = table.outputSchema();
         List<Field> fields = arrow == null ? List.of() : arrow.getFields();
-        if (prunedSchema == null) {
+        List<Integer> ordinals = projectionIds();
+        if (ordinals == null) {
             List<String> all = new ArrayList<>(fields.size());
             for (Field f : fields) all.add(f.getName());
             return all;
         }
-        List<Integer> ordinals = projectionIds();
         List<String> out = new ArrayList<>(ordinals.size());
         for (int ordinal : ordinals) out.add(fields.get(ordinal).getName());
         return out;

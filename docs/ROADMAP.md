@@ -232,7 +232,7 @@ results above were confirmed stable across repeated runs).
 ---
 
 ### 4. Time travel (`AS OF` / `VERSION AS OF` / `TIMESTAMP AS OF`)
-**Status:** ⬜ Not started — **but likely a quick win**, worth doing early
+**Status:** ✅ Done — real feature, but confirmed **zero sweep payoff** (see below)
 
 **What it is:** `VgiTable` already carries `atUnit`/`atValue` fields (currently always `null` —
 plumbed through from day one but never populated). VGI's wire protocol already threads `at_unit`/
@@ -242,22 +242,44 @@ already has the exact right hook: `loadTable(Identifier, String version)` and
 `UnsupportedOperationException` — need to confirm and override). Spark SQL itself has native
 `VERSION AS OF`/`TIMESTAMP AS OF` syntax for exactly this.
 
-**What's needed:** override `VgiCatalog.loadTable(Identifier, String version)` (maps to
-`at_unit="version"`) and `loadTable(Identifier, long timestamp)` (maps to `at_unit="timestamp"`),
-threading the value into `TableInfo`/`catalog_table_scan_function_get`'s existing `at_unit`/
-`at_value` parameters (currently hardcoded `null, null` in `VgiCatalog.loadTable`) and into the
-`VgiTable` it builds.
+**What shipped:** `VgiCatalog.loadTable(Identifier, String version)` (`at_unit="version"`,
+`at_value=version` — Spark hands the literal through verbatim) and `loadTable(Identifier, long
+timestampMicros)` (`at_unit="timestamp"` — the microseconds-since-epoch value Spark resolves the
+clause to is formatted back into a plain `yyyy-MM-dd HH:mm:ss` UTC string, matching the convention
+every VGI client, including DuckDB's own `AT (TIMESTAMP => ...)`, hands workers) both delegate to a
+new private `loadTable(Identifier, String atUnit, String atValue)` that threads the pair into
+`catalog_table_get`, `resolveBranches` (both `catalog_table_scan_branches_get` and the legacy
+`catalog_table_scan_function_get` fallback — previously hardcoded `null, null` in all three calls),
+and the `VgiTable` it builds.
 
-**Unlocks (verify via sweep):**
-- `table/time_travel.test`, `time_travel_pushdown.test` — **2 files**, need `VGI_VERSIONED_WORKER`
-  or similar per the survey — confirm exact fixture requirement before counting on these; if they
-  need a dedicated worker, they move to "real feature, but needs test-infra work too."
-- `table/constraints_time_travel.test` — same caveat.
+**A real, unrelated NPE bug found and fixed along the way:** `VgiScanBuilder.projectedWireNames()`
+NPE'd on `SELECT count(*) FROM t TIMESTAMP AS OF '...'` (no `WHERE`, no projected columns at all) —
+it only special-cased `prunedSchema == null`, not `projectionIds() == null` (which also legitimately
+means "no restriction," per that method's own "empty means no restriction" contract, whenever every
+requested column gets pruned away). Fixed by checking `projectionIds()`'s return directly. Unrelated
+to time travel itself — first caught by a time-travel regression test purely because that query
+shape (bare `count(*)`, no filter) happened to be the first one written that had zero required
+columns.
 
-**Verification:** rerun the sweep; also worth a hand-written live test against whichever fixture
-worker actually supports `at_unit`/`at_value` for a declarative table (check `versioned_data` on
-the standard `example` fixture first — it's already used in `VgiCatalogQueryTest` without an AT
-clause).
+**Unlocks — verified, and confirmed NOT via the sweep:** the real `table/time_travel.test`,
+`time_travel_pushdown.test`, `constraints_time_travel.test` all use the standard fixture (no
+dedicated worker needed — confirmed via `require-env`/`ATTACH`, contrary to this item's original
+"needs `VGI_VERSIONED_WORKER`" guess) and DO reach real time-travel machinery now, but their actual
+`AT (VERSION => 1)`/`AT (TIMESTAMP => ...)` DuckDB inline-clause syntax is rejected outright by
+Spark's parser (confirmed by actually running them: every such record fails with a parse error, not
+a connector error) — Spark's equivalent is the postfix `VERSION AS OF`/`TIMESTAMP AS OF` clause, a
+different grammar entirely, so no amount of connector work makes the real files' AT-clause records
+pass. (Their few non-AT-clause records already passed before this item and are unaffected.) The
+actual capability is verified instead by two new hand-written live tests against the standard
+`example` fixture's `versioned_data` table, using Spark's own syntax: `VgiCatalogQueryTest
+.timeTravelsByVersion` (3 schema-evolving versions, matching the real file's own expected row/column
+counts) and `.timeTravelsByTimestamp` (the same year→version mapping the real file asserts, via
+`TIMESTAMP AS OF`).
+
+**Verification:** `VgiCatalog.loadTable(Identifier, String)` / `.loadTable(Identifier, long)`,
+`VgiScanBuilder.projectedWireNames()` (NPE fix). Tests: `VgiCatalogQueryTest.timeTravelsByVersion` /
+`.timeTravelsByTimestamp` (live, Spark-native syntax — the only way this feature is actually
+exercised, per the syntax-ceiling finding above).
 
 ---
 
@@ -566,3 +588,16 @@ process. Worth adding to `VgiSqlLogicTestSweepTest`'s eligibility gate alongside
   call-order bug that baked in a stale, since-narrowed `column_index`). `table/required_filters_struct.test`
   and `table/required_filters_rowid.test` now pass as curated conformance tests. `required_filters_prefix.test`
   moved to "Won't implement" (DuckDB bracket struct-literal syntax, confirmed unparseable by Spark).
+- **2026-08-25** — Tier 1 item 4 (time travel) done — all 4 Tier 1 items now complete. `VERSION AS
+  OF`/`TIMESTAMP AS OF` work end-to-end (verified live against `versioned_data`), but confirmed zero
+  sweep payoff: the real `time_travel*.test` files use DuckDB's `AT (VERSION => N)` inline-clause
+  syntax, which Spark's parser rejects outright — a syntax-ceiling finding, not a connector gap.
+  Also fixed an unrelated `projectedWireNames()` NPE on any zero-projected-column scan (e.g. a bare
+  `count(*)` with no `WHERE` at all), caught by a time-travel regression test. Also switched
+  `VgiCatalogQueryTest`/`VgiSqlLogicTestConformanceTest`/`VgiSqlLogicTestSweepTest` from the
+  bare-command `subprocess()` worker transport to `unix()`: the bare-command form makes
+  `VgiWorkerClient` fork a fresh `uv run ... vgi-fixture-worker` subprocess for every pooled AND
+  every per-Spark-task connection, which was the dominant cost of the sweep — switching to a single
+  warm worker over a Unix socket cut the sweep's own isolated wall-clock from ~16 minutes to ~4m30s
+  with identical results (430 passed, 9 files fully passing). Test-only change, no production code
+  or behavior affected.

@@ -53,9 +53,11 @@ import java.util.Map;
  * farm.query.vgispark.scan.VgiScan}) and projection/filter/limit pushdown
  * (see {@link farm.query.vgispark.scan.VgiScanBuilder}), plus a scoped
  * subset of catalog scalar functions (see {@link VgiScalarFunctions} for
- * exactly what's supported). No views, no time travel, no VGI table
- * functions (Spark has no SQL equivalent to Trino's {@code TABLE(...)}
- * syntax) — see {@code docs/ROADMAP.md} for what's next.
+ * exactly what's supported) and time travel ({@code VERSION AS OF}/{@code
+ * TIMESTAMP AS OF} — see {@link #loadTable(Identifier, String)}/{@link
+ * #loadTable(Identifier, long)}). No views, no VGI table functions (Spark has
+ * no SQL equivalent to Trino's {@code TABLE(...)} syntax) — see {@code
+ * docs/ROADMAP.md} for what's next.
  */
 public final class VgiCatalog implements TableCatalog, SupportsNamespaces, FunctionCatalog {
 
@@ -166,6 +168,38 @@ public final class VgiCatalog implements TableCatalog, SupportsNamespaces, Funct
 
     @Override
     public Table loadTable(Identifier ident) throws NoSuchTableException {
+        return loadTable(ident, null, null);
+    }
+
+    /**
+     * Time travel by version — {@code SELECT ... FROM t VERSION AS OF '<version>'}. Spark hands the
+     * clause's literal through verbatim (no parsing/validation of its own), matching VGI's own
+     * {@code at_unit="version"}/{@code at_value=<version>} convention exactly — see
+     * {@code docs/ROADMAP.md} tier 1 item 4.
+     */
+    @Override
+    public Table loadTable(Identifier ident, String version) throws NoSuchTableException {
+        return loadTable(ident, "version", version);
+    }
+
+    /**
+     * Time travel by timestamp — {@code SELECT ... FROM t TIMESTAMP AS OF <expr>}. Spark resolves
+     * the clause to microseconds since the Unix epoch (UTC) before calling this overload; VGI's
+     * {@code at_value} wants a plain timestamp STRING (workers parse it themselves — DuckDB's own
+     * {@code AT (TIMESTAMP => ...)} clause passes one through the same way), so the microseconds are
+     * formatted back into one here.
+     */
+    @Override
+    public Table loadTable(Identifier ident, long timestampMicros) throws NoSuchTableException {
+        java.time.Instant instant = java.time.Instant.ofEpochSecond(
+                Math.floorDiv(timestampMicros, 1_000_000L), Math.floorMod(timestampMicros, 1_000_000L) * 1_000L);
+        String atValue = java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")
+                .withZone(java.time.ZoneOffset.UTC)
+                .format(instant);
+        return loadTable(ident, "timestamp", atValue);
+    }
+
+    private Table loadTable(Identifier ident, String atUnit, String atValue) throws NoSuchTableException {
         String schemaName = schemaNameOf(ident);
         String tableName = ident.name();
         // Same constraint as loadNamespaceMetadata above: the checked
@@ -174,15 +208,15 @@ public final class VgiCatalog implements TableCatalog, SupportsNamespaces, Funct
         // (catalog_table_get, then catalog_table_scan_function_get) rather
         // than one connection held across both calls.
         ItemsResponse tableResp = client.withConnection(a ->
-                a.service().catalog_table_get(a.handle(), schemaName, tableName, null, null, null, null));
+                a.service().catalog_table_get(a.handle(), schemaName, tableName, atUnit, atValue, null, null));
         if (tableResp.items().isEmpty()) {
             throw new NoSuchTableException(ident);
         }
         TableInfo info = TableInfoDecoder.decode(tableResp.items().get(0));
-        List<VgiScanBranch> branches = resolveBranches(schemaName, tableName);
+        List<VgiScanBranch> branches = resolveBranches(schemaName, tableName, atUnit, atValue);
 
         return new VgiTable(info.schema_name(), info.name(), branches,
-                info.columns(), info.cardinality_estimate(), null, null, info.required_filters(),
+                info.columns(), info.cardinality_estimate(), atUnit, atValue, info.required_filters(),
                 client, config);
     }
 
@@ -200,16 +234,16 @@ public final class VgiCatalog implements TableCatalog, SupportsNamespaces, Funct
      * branch_filter} (translating VGI's branch-filter grammar into a
      * per-branch pushdown isn't wired up yet).
      */
-    private List<VgiScanBranch> resolveBranches(String schemaName, String tableName) {
+    private List<VgiScanBranch> resolveBranches(String schemaName, String tableName, String atUnit, String atValue) {
         byte[] branchesResponse;
         try {
             branchesResponse = client.withConnection(a ->
                     a.service().catalog_table_scan_branches_get(
-                            a.handle(), schemaName, tableName, null, null, null, null));
+                            a.handle(), schemaName, tableName, atUnit, atValue, null, null));
         } catch (MethodNotImplementedError notMultiBranch) {
             TableScanFunctionGetResponse scan = client.withConnection(a ->
                     a.service().catalog_table_scan_function_get(
-                            a.handle(), schemaName, tableName, null, null, null, null));
+                            a.handle(), schemaName, tableName, atUnit, atValue, null, null));
             byte[] bindArguments = ScanFunctionArguments.toBindArguments(scan.arguments());
             return List.of(new VgiScanBranch(scan.function_name(), bindArguments));
         }
