@@ -57,6 +57,20 @@ import java.util.Set;
  * STARTS_WITH} etc.) — skipped like any other untranslatable predicate, not
  * an error. Extending this is tracked as follow-up work, not a silent gap:
  * v1 ships with exactly the operators {@code ComparisonOperator} has.
+ *
+ * <h2>Struct subfields</h2>
+ *
+ * <p>A predicate rooted at a dotted path into a struct column — {@code s.a},
+ * {@code wrapper.mid.leaf} — is expressible too: the wire form is a {@link
+ * FilterPredicate.StructField} wrapping the leaf comparison, one layer per
+ * path segment, attached to the TOP-level column (the struct itself is what's
+ * projected/indexed; a subfield has no {@link ProjectedColumn} of its own).
+ * {@link #resolveStructPath} walks the Arrow struct's {@code children} to find
+ * each segment's child index and, at the end, the leaf field's own type (the
+ * type a comparison's constant is encoded against — NOT the top-level
+ * struct's type). Only same-column composition applies here too: {@code s.a =
+ * 1 OR s.b = 2} still has two distinct dotted-path "columns" and is skipped,
+ * same as {@code a = 1 OR b = 2} would be.
  */
 public final class VgiFilterTranslator {
 
@@ -65,10 +79,15 @@ public final class VgiFilterTranslator {
     /** One successfully translated top-level predicate: which column it's rooted at, and the predicate itself. */
     public record Translated(String columnName, FilterPredicate predicate) {}
 
+    /** One step down a struct path: the child's index and name within its immediate parent struct. */
+    private record StructStep(int childIndex, String childName) {}
+
     /**
      * Translate as many of {@code predicates} as this class can express, and
      * report the column names actually covered (for {@code
      * TableInfo.required_filters} enforcement — see {@code VgiScanBuilder}).
+     * A covered name is the FULL dotted path (e.g. {@code "s.a"}), matching
+     * the dotted-path strings {@code TableInfo.required_filters} itself uses.
      *
      * @param predicates the predicates Spark offered (one array element per
      *        top-level conjunct)
@@ -82,14 +101,24 @@ public final class VgiFilterTranslator {
      *         see {@link Result#isEmpty()}), plus the set of column names covered
      */
     public static Result translate(Predicate[] predicates, List<Field> fullSchema, List<String> projectedColumnNames) {
-        java.util.Map<String, ArrowType> typeByName = new java.util.LinkedHashMap<>();
-        for (Field f : fullSchema) typeByName.put(f.getName(), f.getType());
+        java.util.Map<String, Field> fieldByName = new java.util.LinkedHashMap<>();
+        for (Field f : fullSchema) fieldByName.put(f.getName(), f);
 
         ProjectedColumns projected = ProjectedColumns.of(projectedColumnNames);
-        PushdownFiltersEncoder encoder = PushdownFiltersEncoder.builder();
         Set<String> covered = new LinkedHashSet<>();
         List<Predicate> pushed = new java.util.ArrayList<>();
-        boolean any = false;
+        // Grouped by TOP-level column, not emitted per Spark predicate: DuckDB's
+        // own TableFilterSet holds at most one (possibly AND-combined) filter
+        // tree per column, and the worker's filter-evaluation code assumes that
+        // shape — sending N separate top-level nodes that all repeat the same
+        // column_index (e.g. one node per struct-subfield conjunct: bbox.xmin,
+        // bbox.ymin, bbox.ymax, bbox.xmax all rooted at column "bbox") was tried
+        // and crashed the reference Python worker's struct-filter evaluator
+        // (IndexError in batch.column(self.column_index)) — combining into one
+        // FilterPredicate.and(...) per column, exactly mirroring what DuckDB's
+        // own serializer sends, avoids relying on that untested wire shape.
+        java.util.Map<String, ProjectedColumn> columnByTopName = new java.util.LinkedHashMap<>();
+        java.util.Map<String, List<FilterPredicate>> translatedByTopName = new java.util.LinkedHashMap<>();
 
         for (Predicate p : predicates == null ? new Predicate[0] : predicates) {
             Set<String> columns = new LinkedHashSet<>();
@@ -98,26 +127,83 @@ public final class VgiFilterTranslator {
                 continue; // zero or multiple distinct columns — not expressible as one column-rooted tree
             }
             String columnName = columns.iterator().next();
-            ArrowType columnType = typeByName.get(columnName);
+            String[] path = columnName.split("\\.");
+            String topName = path[0];
+            Field topField = fieldByName.get(topName);
+            if (topField == null) continue;
+
+            FilterPredicate translated;
+            if (path.length == 1) {
+                translated = translateNode(p, topField.getType());
+            } else {
+                List<StructStep> steps = new java.util.ArrayList<>(path.length - 1);
+                ArrowType leafType = resolveStructPath(topField, path, steps);
+                if (leafType == null) continue; // a segment wasn't found, or a non-struct was navigated into
+                FilterPredicate leaf = translateNode(p, leafType);
+                if (leaf == null) continue;
+                translated = leaf;
+                for (int i = steps.size() - 1; i >= 0; i--) {
+                    StructStep step = steps.get(i);
+                    translated = FilterPredicate.structField(step.childIndex(), step.childName(), translated);
+                }
+            }
+            if (translated == null) continue;
+
             ProjectedColumn projectedColumn;
             try {
-                projectedColumn = projected.column(columnName);
+                projectedColumn = projected.column(topName);
             } catch (IllegalArgumentException notProjected) {
                 continue; // filtering on a column this scan doesn't even project — nothing to root it to
             }
-            if (columnType == null) continue;
 
-            FilterPredicate translated = translateNode(p, columnType);
-            if (translated == null) continue;
-
-            encoder.filter(projectedColumn, translated);
+            columnByTopName.put(topName, projectedColumn);
+            translatedByTopName.computeIfAbsent(topName, k -> new java.util.ArrayList<>()).add(translated);
             covered.add(columnName);
             pushed.add(p);
+        }
+
+        PushdownFiltersEncoder encoder = PushdownFiltersEncoder.builder();
+        boolean any = false;
+        for (java.util.Map.Entry<String, List<FilterPredicate>> e : translatedByTopName.entrySet()) {
+            List<FilterPredicate> group = e.getValue();
+            FilterPredicate combined = group.size() == 1 ? group.get(0)
+                    : new FilterPredicate.And(List.copyOf(group));
+            encoder.filter(columnByTopName.get(e.getKey()), combined);
             any = true;
         }
 
         EncodedPushdownFilters encoded = any ? encoder.encode() : null;
         return new Result(encoded, Set.copyOf(covered), pushed.toArray(new Predicate[0]));
+    }
+
+    /**
+     * Walk {@code path[1..]} down {@code topField}'s struct children,
+     * recording each segment's (childIndex, childName) into {@code stepsOut}
+     * in outer-to-inner order.
+     *
+     * @return the leaf field's Arrow type, or {@code null} if any segment
+     *         isn't found (including navigating into a non-struct field)
+     */
+    private static ArrowType resolveStructPath(Field topField, String[] path, List<StructStep> stepsOut) {
+        Field current = topField;
+        ArrowType leafType = null;
+        for (int i = 1; i < path.length; i++) {
+            List<Field> children = current.getChildren();
+            Field found = null;
+            int foundIndex = -1;
+            for (int j = 0; j < children.size(); j++) {
+                if (children.get(j).getName().equals(path[i])) {
+                    found = children.get(j);
+                    foundIndex = j;
+                    break;
+                }
+            }
+            if (found == null) return null;
+            stepsOut.add(new StructStep(foundIndex, path[i]));
+            current = found;
+            leafType = current.getType();
+        }
+        return leafType;
     }
 
     /**

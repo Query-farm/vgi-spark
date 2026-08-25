@@ -198,4 +198,56 @@ class VgiSqlLogicTestConformanceTest {
         assertEquals(7, result.skipped(), "expected skip count changed — see MULTI_BRANCH_NON_PORTABLE_MARKERS");
         assertEquals(5, result.executed(), "expected executed-record count changed");
     }
+
+    /**
+     * {@code table/required_filters_struct.test} — struct-subfield required
+     * paths (see {@code docs/ROADMAP.md}, tier 1 item 3): {@code rff_struct}
+     * requires filters on both {@code s.a} and {@code s.b}, {@code rff_nested}
+     * requires one on the 3-deep path {@code wrapper.mid.leaf}. Every record
+     * is plain declarative SQL — no table-function-call syntax, no DuckDB-only
+     * introspection — so only {@code ATTACH}/{@code DETACH} are non-portable.
+     */
+    private static final List<String> REQUIRED_FILTERS_STRUCT_NON_PORTABLE_MARKERS = List.of("ATTACH ", "DETACH");
+
+    @Test
+    @Timeout(180)
+    void requiredFiltersStructMatchesTheRealTestFile() throws Exception {
+        Path testFile = VGI_TEST_ROOT.toPath().resolve("table/required_filters_struct.test");
+        Assumptions.assumeTrue(testFile.toFile().isFile(), testFile + " not present");
+
+        SqlLogicTestRunner.Result result = SqlLogicTestRunner.run(spark, testFile,
+                "example.", SPARK_CATALOG, REQUIRED_FILTERS_STRUCT_NON_PORTABLE_MARKERS);
+
+        if (!result.failures().isEmpty()) {
+            fail(result.executed() + " executed, " + result.skipped() + " skipped, "
+                    + result.failures().size() + " FAILED:\n" + String.join("\n---\n", result.failures()));
+        }
+        assertEquals(2, result.skipped(), "expected skip count changed — see REQUIRED_FILTERS_STRUCT_NON_PORTABLE_MARKERS");
+        assertEquals(8, result.executed(), "expected executed-record count changed");
+    }
+
+    /**
+     * {@code table/required_filters_rowid.test} — {@code required_filters}
+     * coexisting with a virtual row-id column (see {@code docs/ROADMAP.md},
+     * tier 1 item 3's {@code required_filters_rowid.test} unlock). Every
+     * record is plain declarative SQL.
+     */
+    private static final List<String> REQUIRED_FILTERS_ROWID_NON_PORTABLE_MARKERS = List.of("ATTACH ", "DETACH");
+
+    @Test
+    @Timeout(180)
+    void requiredFiltersRowidMatchesTheRealTestFile() throws Exception {
+        Path testFile = VGI_TEST_ROOT.toPath().resolve("table/required_filters_rowid.test");
+        Assumptions.assumeTrue(testFile.toFile().isFile(), testFile + " not present");
+
+        SqlLogicTestRunner.Result result = SqlLogicTestRunner.run(spark, testFile,
+                "example.", SPARK_CATALOG, REQUIRED_FILTERS_ROWID_NON_PORTABLE_MARKERS);
+
+        if (!result.failures().isEmpty()) {
+            fail(result.executed() + " executed, " + result.skipped() + " skipped, "
+                    + result.failures().size() + " FAILED:\n" + String.join("\n---\n", result.failures()));
+        }
+        assertEquals(2, result.skipped(), "expected skip count changed — see REQUIRED_FILTERS_ROWID_NON_PORTABLE_MARKERS");
+        assertEquals(4, result.executed(), "expected executed-record count changed");
+    }
 }

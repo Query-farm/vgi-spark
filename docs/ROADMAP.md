@@ -157,32 +157,77 @@ returns/args (same bridge gap as scalar), `ConstParam` folding.
 ---
 
 ### 3. Struct-subfield filter pushdown
-**Status:** ⬜ Not started (known gap, already documented in `VgiFilterTranslator`)
+**Status:** ✅ Done
 
 **What it is:** `VgiFilterTranslator.collectColumns` already resolves a `NamedReference` like `s.a`
 to the dotted path `"s.a"` — the piece that's missing is building `FilterPredicate.StructField`
 (already exists in `farm.query.vgi.client.FilterPredicate`, unused today) instead of failing to
 find a projected column named literally `"s.a"`.
 
-**What's needed:** in `VgiFilterTranslator.translate`, when a predicate's single referenced column
-is a dotted path into a struct, resolve the TOP-level column (`"s"`) as the `ProjectedColumn`, walk
-the Arrow struct's child fields to find `"a"`'s child index/type, and wrap the leaf comparison in
-one `FilterPredicate.structField(childIndex, childName, leafPredicate)` per path segment (nested
-structs need repeated wrapping). `required_filters`' "covered columns" check also needs to accept a
-struct-rooted top-level match (a required group naming `s.a` is satisfied by a pushed filter on
-`s.a`, using the same dotted-path string already used today — should fall out for free once
-translation succeeds, since `coveredColumns` already stores the full dotted path).
+**What shipped:** `VgiFilterTranslator.translate` splits a predicate's dotted column path on `.`,
+resolves the TOP-level segment as the `ProjectedColumn` (a subfield has no projected index of its
+own — the struct itself is what's projected), and walks the Arrow struct's `children` (by name, not
+assumed position) via a new `resolveStructPath` to find each segment's child index/type, wrapping
+the leaf comparison in one `FilterPredicate.structField(childIndex, childName, ...)` per path segment
+(confirmed working 3-deep, `wrapper.mid.leaf`). `required_filters`' "covered columns" check needed no
+change — it already stores the full dotted path, so a required group naming `s.a` is satisfied
+directly by a translated `s.a` predicate.
 
-**Unlocks (verify via sweep):**
-- `table/required_filters_struct.test`, `required_filters_complex.test`, `required_filters_prefix.test`,
-  `required_filters_rowid.test` — **4 files**, straightforward struct-subfield comparisons.
-- NOT unlocked: `required_filters_disjunction_null.test` (also needs `IN` pushdown — separate item),
-  `required_filters_above_get.test` (tests a DuckDB-specific "filter survives above the scan"
-  planner-internal invariant with wrapped expressions like `s.a + 1 = 2` — likely **Won't
-  implement**, no Catalyst analogue to assert against), `required_filters_native.test` (needs
-  `VGI_TEST_BRANCH_DIR` too).
+**Two real bugs found and fixed along the way** (both pre-existing, exposed by a query shape nothing
+had exercised before — multiple filters on subfields of the *same* struct column):
+1. Multiple top-level Spark predicates rooted at the same column (e.g. `bbox.xmin >= 0 AND bbox.ymin
+   > 0 AND ...`, 4 distinct subfields of one `bbox` struct) were each sent as their own top-level
+   wire filter node, all repeating the same `column_index` — a shape the reference Python worker's
+   struct-filter evaluator had never been exercised with and crashed on (`IndexError` in
+   `batch.column(self.column_index)`). Fixed by grouping translated predicates by top-level column
+   and combining each group into one `FilterPredicate.And(...)` before encoding — mirroring how
+   DuckDB's own `TableFilterSet` holds at most one (possibly AND-combined) filter tree per column; a
+   strictly better encoding regardless (smaller wire payload), not merely a worker-side workaround.
+2. **The real bug, worth remembering for any future pushdown work**: `VgiScanBuilder` used to
+   translate filters (baking in `column_index`, relative to the *final projected column list*)
+   inside `pushPredicates()`, but Spark does **not** guarantee `pruneColumns()` runs before
+   `pushPredicates()` — confirmed empirically: for `SELECT count(*) FROM t WHERE bbox.xmin >= 0`,
+   Spark pushes filters while the projection is still unrestricted, then narrows it to just `bbox`
+   afterward. The baked-in `column_index` went stale once the projection narrowed, silently pointing
+   past the end of the worker's actual (narrower) output batch — the worker's IPC stream read then
+   failed outright. Fixed by deferring translation to `build()` (a preliminary translation still runs
+   in `pushPredicates()` for `pushedPredicates()`'s informational/EXPLAIN-only contract), which
+   executes only after every pushdown callback has completed, so the projection used to encode is
+   always the one actually sent.
 
-**Verification:** rerun the sweep, check `table/required_filters_*.test`.
+**Unlocks — verified:**
+- `table/required_filters_struct.test` — passing curated conformance test
+  (`VgiSqlLogicTestConformanceTest.requiredFiltersStructMatchesTheRealTestFile`, 8 executed / 2
+  skipped: both `s.a`/`s.b` and the 3-deep `wrapper.mid.leaf` path).
+- `table/required_filters_rowid.test` — passing curated conformance test
+  (`requiredFiltersRowidMatchesTheRealTestFile`, 4 executed / 2 skipped) — the file that exposed both
+  bugs above (4 subfields of `bbox`, filtered without appearing in the output projection).
+- `table/required_filters_complex.test` — partial credit: its struct-subfield records now pass; the
+  remaining failures are `CREATE VIEW`/`DROP VIEW` (tier 2 item 5, VGI views — unrelated to this item).
+- New live regression tests in `VgiCatalogQueryTest` pin both bugs directly (not just via the sweep):
+  `filtersOnAStructSubfield`, `filtersOnA3DeepNestedStructPath`,
+  `filtersOnFourSubfieldsOfOneStructColumnNotInTheOutputProjection` (reproduces the push-before-prune
+  crash shape exactly).
+
+**NOT unlocked** (confirmed by actually running them, not assumed):
+- `required_filters_prefix.test` — every record uses DuckDB's `{a: 1, b: 10}::STRUCT(...)` bracket
+  struct-literal syntax, which Spark's parser rejects outright — no struct pushdown work changes
+  that. Moved to **Won't implement** below (a Spark SQL syntax ceiling, not a connector gap).
+- `required_filters_disjunction_null.test` — needs cross-column `OR` and `IN` pushdown (separate,
+  already-tracked `VgiFilterTranslator` gaps, not struct-specific).
+- `required_filters_above_get.test` — as predicted, a DuckDB planner-internal invariant with wrapped
+  expressions (`COALESCE(s.a, 0) > 0`), no Catalyst analogue.
+- `required_filters_native.test` — needs `VGI_TEST_BRANCH_DIR` too.
+
+**Verification:** `VgiFilterTranslator.resolveStructPath`/`translate` (grouped encoding),
+`VgiScanBuilder` (deferred translation). Tests: `VgiSqlLogicTestConformanceTest
+.requiredFiltersStructMatchesTheRealTestFile` / `.requiredFiltersRowidMatchesTheRealTestFile`
+(curated, real files), 3 new `VgiCatalogQueryTest` live regression tests, `VgiSqlLogicTestSweepTest`
+(general sweep — note this test's own total pass count has run-to-run noise from unrelated Spark
+internal-error flakiness under sustained load, ~10-15 records across totally unconnected queries
+including pure local `range(...)` ones with no VGI involvement at all — a pre-existing
+sweep-harness characteristic, not something this item introduced; the per-file struct-subfield
+results above were confirmed stable across repeated runs).
 
 ---
 
@@ -444,6 +489,12 @@ struct-subfield pushdown, item 3).
   assert against. Would need entirely new Spark-native tests, not a port — treat "should vgi-spark
   have its own result cache" as a completely separate product decision, unrelated to sqllogictest
   conformance.
+- **DuckDB bracket struct-literal syntax** (`{a: 1, b: 10}::STRUCT(...)`) — `table/
+  required_filters_prefix.test`'s entire content (3 records). Confirmed by actually running it:
+  Spark's parser rejects `{...}` map/struct-literal syntax outright, independent of any pushdown
+  feature (see tier 1 item 3's own "not unlocked" note). Spark's equivalent is `named_struct(...)`/
+  `struct(...)`, a different literal syntax entirely — porting the file would mean rewriting its
+  queries, not translating a connector gap.
 - **DuckDB SQL macros** (`macro/macros.test`). Confirmed worker-provided (not DuckDB-native), but
   the underlying mechanism — text-substitution/inlining at bind time — has no Spark `FunctionCatalog`
   equivalent (Spark functions are typed/bound, never text-expanded) regardless of who authored the
@@ -510,3 +561,8 @@ process. Worth adding to `VgiSqlLogicTestSweepTest`'s eligibility gate alongside
   state as of commit `2c6ecc8` (end of the original 5-phase plan).
 - **2026-08-25** — Tier 1 item 1 (multi-branch tables, function branches only) done. `splits/multi_branch.test`
   now passes as a curated conformance test; general sweep +17 records (405 → 422 passing).
+- **2026-08-25** — Tier 1 item 3 (struct-subfield filter pushdown) done. Found and fixed two real bugs
+  along the way (same-column-repeated-`column_index` crash; a `pushPredicates()`-vs-`pruneColumns()`
+  call-order bug that baked in a stale, since-narrowed `column_index`). `table/required_filters_struct.test`
+  and `table/required_filters_rowid.test` now pass as curated conformance tests. `required_filters_prefix.test`
+  moved to "Won't implement" (DuckDB bracket struct-literal syntax, confirmed unparseable by Spark).

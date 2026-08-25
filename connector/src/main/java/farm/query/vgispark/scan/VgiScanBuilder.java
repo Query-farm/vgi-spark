@@ -35,6 +35,21 @@ import java.util.Map;
  * Limit} — see {@code VgiCatalogConfig}/{@code InitRequest.row_limit}'s own
  * javadoc on "over-production is legal"). Only column pruning is exact: a
  * column this builder doesn't request is genuinely never read.
+ *
+ * <p><strong>Filter translation is deferred to {@link #build}, not done in
+ * {@link #pushPredicates}.</strong> {@code column_index} in the encoded wire
+ * form is relative to the FINAL projected column list (see {@link
+ * VgiFilterTranslator}'s own javadoc), but Spark does not guarantee {@link
+ * #pruneColumns} runs before {@link #pushPredicates} — confirmed empirically
+ * here: for a query like {@code SELECT count(*) FROM t WHERE bbox.xmin >= 0},
+ * Spark calls {@code pushPredicates} while the projection is still
+ * unrestricted (every column), THEN calls {@code pruneColumns} to narrow it
+ * to just {@code bbox}. Translating at push-time baked in a {@code
+ * column_index} for the WRONG (wider) projection, silently corrupting the
+ * scan (the worker read past the end of its own narrower output batch and
+ * threw). Recomputing in {@code build()} — after every pushdown callback has
+ * definitely run — uses the projection that's actually sent, so the two can
+ * never disagree.
  */
 public final class VgiScanBuilder implements ScanBuilder,
         SupportsPushDownRequiredColumns, SupportsPushDownV2Filters, SupportsPushDownLimit {
@@ -44,8 +59,8 @@ public final class VgiScanBuilder implements ScanBuilder,
     private final VgiTable table;
 
     private StructType prunedSchema;
+    private Predicate[] rawPredicates = new Predicate[0];
     private Predicate[] pushedPredicates = new Predicate[0];
-    private VgiFilterTranslator.Result filterResult;
     private long limit = -1;
 
     /**
@@ -66,10 +81,14 @@ public final class VgiScanBuilder implements ScanBuilder,
 
     @Override
     public Predicate[] pushPredicates(Predicate[] predicates) {
-        Schema arrow = table.outputSchema();
-        List<Field> fields = arrow == null ? List.of() : arrow.getFields();
-        this.filterResult = VgiFilterTranslator.translate(predicates, fields, projectedWireNames());
-        this.pushedPredicates = filterResult.pushedPredicates();
+        this.rawPredicates = predicates;
+        // Informational only here (see class javadoc): whatever the CURRENT
+        // (possibly not-yet-final) projection translates to, good enough for
+        // SupportsPushDownV2Filters#pushedPredicates/EXPLAIN output. The
+        // authoritative translation — the one whose column_index actually
+        // reaches the worker — happens in build(), against the final
+        // projection.
+        this.pushedPredicates = translate().pushedPredicates();
         // The full input array, unchanged: nothing here is authoritative, so
         // Spark must still evaluate every one of these against every row —
         // see this class's own javadoc.
@@ -89,12 +108,23 @@ public final class VgiScanBuilder implements ScanBuilder,
 
     @Override
     public Scan build() {
-        checkRequiredFilters();
+        // Recompute against the FINAL projection — see class javadoc on why
+        // this can't reuse whatever pushPredicates() computed earlier.
+        VgiFilterTranslator.Result filterResult = translate();
+        this.pushedPredicates = filterResult.pushedPredicates();
+        checkRequiredFilters(filterResult);
         List<Integer> projectionIds = projectionIds();
-        EncodedPushdownFilters encoded = filterResult == null ? null : filterResult.encoded();
+        EncodedPushdownFilters encoded = filterResult.encoded();
         byte[] pushdownFiltersBytes = encoded == null ? null : encoded.pushdownFilters();
         Long rowLimit = limit < 0 ? null : limit;
         return new VgiScan(client, config, table, projectionIds, pushdownFiltersBytes, rowLimit);
+    }
+
+    /** Translate {@link #rawPredicates} against the CURRENT projection (see class javadoc for why this is re-run). */
+    private VgiFilterTranslator.Result translate() {
+        Schema arrow = table.outputSchema();
+        List<Field> fields = arrow == null ? List.of() : arrow.getFields();
+        return VgiFilterTranslator.translate(rawPredicates, fields, projectedWireNames());
     }
 
     /**
@@ -152,10 +182,10 @@ public final class VgiScanBuilder implements ScanBuilder,
      * required_filters} exists to refuse rather than let through as an
      * unbounded scan.
      */
-    private void checkRequiredFilters() {
+    private void checkRequiredFilters(VgiFilterTranslator.Result filterResult) {
         List<List<String>> requiredGroups = table.requiredFilters();
         if (requiredGroups == null || requiredGroups.isEmpty()) return;
-        java.util.Set<String> covered = filterResult == null ? java.util.Set.of() : filterResult.coveredColumns();
+        java.util.Set<String> covered = filterResult.coveredColumns();
         for (List<String> group : requiredGroups) {
             boolean satisfied = group.stream().anyMatch(covered::contains);
             if (!satisfied) {

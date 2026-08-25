@@ -169,4 +169,51 @@ class VgiCatalogQueryTest {
             assertEquals("global_scalar:" + i, rows.get(i).getString(0));
         }
     }
+
+    @Test
+    @Timeout(60)
+    void filtersOnAStructSubfield() {
+        // rff_struct requires filters on BOTH s.a and s.b (TableInfo
+        // .required_filters) — this also exercises VgiFilterTranslator's
+        // struct-path resolution (FilterPredicate.StructField) for two
+        // different subfields of the same top-level column.
+        List<Row> rows = spark.sql(
+                "SELECT s.a, s.b FROM " + CATALOG + ".data.rff_struct WHERE s.a = 2 AND s.b = 20")
+                .collectAsList();
+        assertEquals(1, rows.size());
+        assertEquals(2L, rows.get(0).getLong(0));
+        assertEquals(20L, rows.get(0).getLong(1));
+    }
+
+    @Test
+    @Timeout(60)
+    void filtersOnA3DeepNestedStructPath() {
+        List<Row> rows = spark.sql(
+                "SELECT wrapper.mid.leaf FROM " + CATALOG + ".data.rff_nested WHERE wrapper.mid.leaf = 2")
+                .collectAsList();
+        assertEquals(1, rows.size());
+        assertEquals(2L, rows.get(0).getLong(0));
+    }
+
+    @Test
+    @Timeout(60)
+    void filtersOnFourSubfieldsOfOneStructColumnNotInTheOutputProjection() {
+        // Regression test: a query whose SELECT list doesn't reference the
+        // struct column at all (only its WHERE clause does) is exactly the
+        // shape that exposed a real bug — Spark calls pushPredicates() (which
+        // used to translate filters into column_index immediately) BEFORE
+        // pruneColumns() narrows the projection down to just this one struct
+        // column, so a filter's column_index baked in at push-time pointed
+        // past the end of the FINAL (narrower) projected batch the worker
+        // actually returned. VgiScanBuilder now defers translation to
+        // build(), after every pushdown callback has run. Also exercises
+        // more than 2 struct children combined into one column, unlike the
+        // rff_struct case above (which only has 2).
+        List<Row> rows = spark.sql(
+                "SELECT count(*) FROM " + CATALOG + ".data.rff_rowid "
+                        + "WHERE bbox.xmin >= 0 AND bbox.ymin > 0 AND bbox.ymax <= 100 AND bbox.xmax <= 100.2")
+                .collectAsList();
+        assertEquals(1, rows.size());
+        assertEquals(10L, rows.get(0).getLong(0));
+    }
 }
