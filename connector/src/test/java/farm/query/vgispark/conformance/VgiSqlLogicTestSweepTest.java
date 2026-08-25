@@ -90,7 +90,22 @@ class VgiSqlLogicTestSweepTest {
                 "~/Development/vgi-python not present — skipping sqllogictest sweep");
         Assumptions.assumeTrue(VGI_TEST_ROOT.isDirectory(),
                 "~/Development/vgi/test/sql/integration not present — skipping sqllogictest sweep");
-        worker = VgiWorkerHarness.subprocess(VGI_PYTHON);
+        // unix(), not subprocess(): a bare-command location makes VgiWorkerClient
+        // fork a FRESH "uv run ... vgi-fixture-worker" subprocess for every
+        // pooled connection AND every per-task connection VgiPartitionReader
+        // opens (see that class's own javadoc — executors don't share the
+        // driver's pool) — with ~2900 records across 191 files, that's
+        // thousands of subprocess spawns and was the dominant cost of this
+        // sweep. unix() starts ONE real worker process up front and hands out
+        // a unix:// socket location instead, so every one of those "new
+        // connection" calls becomes a cheap socket connect to an
+        // already-running, already-warm worker (the reference worker's own
+        // --unix mode defaults to --threaded, i.e. built to serve many
+        // concurrent connections — this is exactly the "pool of one warm
+        // worker" shape the VGI protocol's own launch: scheme formalizes,
+        // see docs/ROADMAP.md tier 3, just without that scheme's cross-process
+        // sharing).
+        worker = VgiWorkerHarness.unix(VGI_PYTHON);
 
         spark = SparkSession.builder()
                 .master("local[2]")

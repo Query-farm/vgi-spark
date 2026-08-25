@@ -46,7 +46,9 @@ class VgiCatalogQueryTest {
     void start() throws Exception {
         Assumptions.assumeTrue(VGI_PYTHON.isDirectory(),
                 "~/Development/vgi-python not present — skipping VGI catalog query test");
-        worker = VgiWorkerHarness.subprocess(VGI_PYTHON);
+        // unix(), not subprocess() — see VgiSqlLogicTestSweepTest's identical
+        // comment: avoids forking a fresh worker subprocess per Spark task.
+        worker = VgiWorkerHarness.unix(VGI_PYTHON);
 
         spark = SparkSession.builder()
                 .master("local[2]")
@@ -215,5 +217,54 @@ class VgiCatalogQueryTest {
                 .collectAsList();
         assertEquals(1, rows.size());
         assertEquals(10L, rows.get(0).getLong(0));
+    }
+
+    @Test
+    @Timeout(60)
+    void timeTravelsByVersion() {
+        // versioned_data has 3 schema-evolving versions (see the real
+        // table/time_travel.test this mirrors): v1 is (id) with 3 rows, v2 is
+        // (id, name, score, active) with 5 rows, v3/current is (id, score)
+        // with 4 rows. VERSION AS OF drives VgiCatalog.loadTable(Identifier,
+        // String) -> at_unit="version".
+        List<Row> v1 = spark.sql(
+                "SELECT * FROM " + CATALOG + ".data.versioned_data VERSION AS OF '1' ORDER BY id")
+                .collectAsList();
+        assertEquals(3, v1.size());
+        assertEquals(1, v1.get(0).length()); // v1's schema is (id) only
+
+        List<Row> v2 = spark.sql(
+                "SELECT name FROM " + CATALOG + ".data.versioned_data VERSION AS OF '2' ORDER BY name")
+                .collectAsList();
+        assertEquals(List.of("alice", "bob", "carol", "dave", "eve"),
+                v2.stream().map(r -> r.getString(0)).toList());
+
+        List<Row> current = spark.sql("SELECT * FROM " + CATALOG + ".data.versioned_data ORDER BY id")
+                .collectAsList();
+        assertEquals(4, current.size());
+    }
+
+    @Test
+    @Timeout(60)
+    void timeTravelsByTimestamp() {
+        // TIMESTAMP AS OF drives VgiCatalog.loadTable(Identifier, long) —
+        // Spark resolves the literal to epoch micros before calling it, and
+        // the connector formats that back into a plain timestamp string for
+        // at_value (see that overload's own javadoc). Same year -> version
+        // mapping as the real table/time_travel.test.
+        List<Row> at2020 = spark.sql(
+                "SELECT count(*) FROM " + CATALOG + ".data.versioned_data TIMESTAMP AS OF '2020-06-15'")
+                .collectAsList();
+        assertEquals(3L, at2020.get(0).getLong(0));
+
+        List<Row> at2021 = spark.sql(
+                "SELECT count(*) FROM " + CATALOG + ".data.versioned_data TIMESTAMP AS OF '2021-06-15'")
+                .collectAsList();
+        assertEquals(5L, at2021.get(0).getLong(0));
+
+        List<Row> at2022 = spark.sql(
+                "SELECT count(*) FROM " + CATALOG + ".data.versioned_data TIMESTAMP AS OF '2022-06-15'")
+                .collectAsList();
+        assertEquals(4L, at2022.get(0).getLong(0));
     }
 }

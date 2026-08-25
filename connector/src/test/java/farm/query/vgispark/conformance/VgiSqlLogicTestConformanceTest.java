@@ -54,7 +54,9 @@ class VgiSqlLogicTestConformanceTest {
                 "~/Development/vgi-python not present — skipping sqllogictest conformance run");
         Assumptions.assumeTrue(VGI_TEST_ROOT.isDirectory(),
                 "~/Development/vgi/test/sql/integration not present — skipping sqllogictest conformance run");
-        worker = VgiWorkerHarness.subprocess(VGI_PYTHON);
+        // unix(), not subprocess() — see VgiSqlLogicTestSweepTest's identical
+        // comment: avoids forking a fresh worker subprocess per Spark task.
+        worker = VgiWorkerHarness.unix(VGI_PYTHON);
 
         spark = SparkSession.builder()
                 .master("local[2]")
