@@ -16,6 +16,8 @@ import org.apache.spark.sql.connector.catalog.TableCapability;
 import org.apache.spark.sql.connector.read.ScanBuilder;
 import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Set;
 
 /**
@@ -81,15 +83,30 @@ public record VgiTable(
 
     @Override
     public Column[] columns() {
+        // A VGI row-id field is exposed here like any other column, just
+        // renamed (VgiColumnNames.displayName) — NOT hidden from SELECT *.
+        //
+        // DuckDB and vgi-trino both hide it (a genuine pseudo-column, visible
+        // only when named explicitly). Spark's matching mechanism —
+        // SupportsMetadataColumns — was tried here and reverted: it made
+        // Table.columns() exclude the field and Table.metadataColumns()
+        // offer it instead, but Spark's own metadata-column attribute
+        // resolution didn't consistently reach VgiScanBuilder.pruneColumns's
+        // requiredSchema for every query shape that referenced it, and a
+        // physical-plan attribute-binding crash (a wrong answer's evil twin —
+        // a hard failure — is a strictly worse outcome than an extra visible
+        // column) is worse than the display imperfection this would have
+        // fixed. Follow-up work, not a silent gap: track down exactly which
+        // metadata-column resolution path Spark expects a V2 source to
+        // participate in before re-attempting.
         Schema arrow = outputSchema();
-        java.util.List<Field> fields = arrow == null ? java.util.List.of() : arrow.getFields();
-        Column[] out = new Column[fields.size()];
-        for (int i = 0; i < fields.size(); i++) {
-            Field field = fields.get(i);
-            out[i] = Column.create(
-                    VgiColumnNames.displayName(field), VgiTypeMapping.toSparkType(field), field.isNullable());
+        List<Field> fields = arrow == null ? List.of() : arrow.getFields();
+        List<Column> out = new ArrayList<>(fields.size());
+        for (Field field : fields) {
+            out.add(Column.create(
+                    VgiColumnNames.displayName(field), VgiTypeMapping.toSparkType(field), field.isNullable()));
         }
-        return out;
+        return out.toArray(new Column[0]);
     }
 
     @Override
