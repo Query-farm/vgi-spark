@@ -10,16 +10,20 @@ import farm.query.vgi.protocol.TableInfo;
 import farm.query.vgi.protocol.TableScanFunctionGetResponse;
 import farm.query.vgirpc.marshal.RecordCodec;
 import farm.query.vgispark.client.VgiWorkerClient;
+import farm.query.vgispark.function.VgiScalarFunctions;
 import org.apache.spark.sql.catalyst.analysis.NamespaceAlreadyExistsException;
+import org.apache.spark.sql.catalyst.analysis.NoSuchFunctionException;
 import org.apache.spark.sql.catalyst.analysis.NoSuchNamespaceException;
 import org.apache.spark.sql.catalyst.analysis.NoSuchTableException;
 import org.apache.spark.sql.catalyst.analysis.TableAlreadyExistsException;
+import org.apache.spark.sql.connector.catalog.FunctionCatalog;
 import org.apache.spark.sql.connector.catalog.Identifier;
 import org.apache.spark.sql.connector.catalog.NamespaceChange;
 import org.apache.spark.sql.connector.catalog.SupportsNamespaces;
 import org.apache.spark.sql.connector.catalog.Table;
 import org.apache.spark.sql.connector.catalog.TableCatalog;
 import org.apache.spark.sql.connector.catalog.TableChange;
+import org.apache.spark.sql.connector.catalog.functions.UnboundFunction;
 import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 
 import java.util.ArrayList;
@@ -40,13 +44,16 @@ import java.util.Map;
  * constructor and {@link #initialize}.
  *
  * <p>v1 scope: read-only discovery of declarative/function-backed tables via
- * the legacy single-function scan path (real multi-split parallel scans —
- * see {@link farm.query.vgispark.scan.VgiScan}). No pushdown yet (a later
- * phase), no multi-branch tables ({@code catalog_table_scan_branches_get}),
- * no views, no time travel, no catalog scalar functions yet — see the plan's
- * phased delivery.
+ * the legacy single-function scan path, with real multi-split parallel scans
+ * (see {@link farm.query.vgispark.scan.VgiScan}) and projection/filter/limit
+ * pushdown (see {@link farm.query.vgispark.scan.VgiScanBuilder}), plus a
+ * scoped subset of catalog scalar functions (see {@link VgiScalarFunctions}
+ * for exactly what's supported). No multi-branch tables ({@code
+ * catalog_table_scan_branches_get}), no views, no time travel, no VGI table
+ * functions (Spark has no SQL equivalent to Trino's {@code TABLE(...)}
+ * syntax) — see the plan's phased delivery.
  */
-public final class VgiCatalog implements TableCatalog, SupportsNamespaces {
+public final class VgiCatalog implements TableCatalog, SupportsNamespaces, FunctionCatalog {
 
     private String name;
     private VgiCatalogConfig config;
@@ -203,6 +210,20 @@ public final class VgiCatalog implements TableCatalog, SupportsNamespaces {
     public void renameTable(Identifier oldIdent, Identifier newIdent)
             throws NoSuchTableException, TableAlreadyExistsException {
         throw new UnsupportedOperationException("vgi-spark is read-only in this version: cannot rename a table");
+    }
+
+    // ------------------------------------------------------------------
+    // FunctionCatalog — see VgiScalarFunctions for what's actually supported
+    // ------------------------------------------------------------------
+
+    @Override
+    public Identifier[] listFunctions(String[] namespace) {
+        return VgiScalarFunctions.listFunctions(client, namespace);
+    }
+
+    @Override
+    public UnboundFunction loadFunction(Identifier ident) throws NoSuchFunctionException {
+        return VgiScalarFunctions.loadFunction(client, config, ident);
     }
 
     /**

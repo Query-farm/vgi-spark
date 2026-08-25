@@ -140,4 +140,33 @@ class VgiCatalogQueryTest {
         List<Row> rows = df.collectAsList();
         assertTrue(!rows.isEmpty(), "expected at least one row from versioned_data");
     }
+
+    @Test
+    @Timeout(60)
+    void callsARealCatalogScalarFunction() {
+        // global_scalar(value: int64) -> string, registered in the "main"
+        // schema, single positional non-const argument — exactly VgiCatalog's
+        // (FunctionCatalog) v1 scope. Exercises the full bind-once/exchange-
+        // per-row path against a live worker, including the InternalRow <->
+        // Arrow value bridge for both a numeric argument and a string result.
+        Row result = spark.sql("SELECT " + CATALOG + ".main.global_scalar(7) AS r").collectAsList().get(0);
+        assertEquals("global_scalar:7", result.getString(0));
+    }
+
+    @Test
+    @Timeout(60)
+    void callsACatalogScalarFunctionAcrossManyRows() {
+        // Runs the function once per row of a real scan (100 rows), on
+        // whatever executor task processes them — proves the lazy
+        // per-task connection + TaskContext cleanup path, not just a
+        // single-call smoke test.
+        List<Row> rows = spark.sql(
+                "SELECT " + CATALOG + ".main.global_scalar(value) AS r FROM " + CATALOG + ".data.numbers "
+                        + "WHERE value < 5 ORDER BY value")
+                .collectAsList();
+        assertEquals(5, rows.size());
+        for (int i = 0; i < 5; i++) {
+            assertEquals("global_scalar:" + i, rows.get(i).getString(0));
+        }
+    }
 }
