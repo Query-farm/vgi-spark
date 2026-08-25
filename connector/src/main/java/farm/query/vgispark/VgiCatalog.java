@@ -8,7 +8,10 @@ import farm.query.vgi.protocol.ItemsResponse;
 import farm.query.vgi.protocol.SchemaInfo;
 import farm.query.vgi.protocol.TableInfo;
 import farm.query.vgi.protocol.TableScanFunctionGetResponse;
+import farm.query.vgirpc.MethodNotImplementedError;
 import farm.query.vgirpc.marshal.RecordCodec;
+import farm.query.vgispark.branch.ScanBranchesDecoder;
+import farm.query.vgispark.branch.VgiScanBranch;
 import farm.query.vgispark.client.VgiWorkerClient;
 import farm.query.vgispark.function.VgiScalarFunctions;
 import org.apache.spark.sql.catalyst.analysis.NamespaceAlreadyExistsException;
@@ -43,15 +46,16 @@ import java.util.Map;
  * is flatter, one class instantiated by Spark via a public no-arg
  * constructor and {@link #initialize}.
  *
- * <p>v1 scope: read-only discovery of declarative/function-backed tables via
- * the legacy single-function scan path, with real multi-split parallel scans
- * (see {@link farm.query.vgispark.scan.VgiScan}) and projection/filter/limit
- * pushdown (see {@link farm.query.vgispark.scan.VgiScanBuilder}), plus a
- * scoped subset of catalog scalar functions (see {@link VgiScalarFunctions}
- * for exactly what's supported). No multi-branch tables ({@code
- * catalog_table_scan_branches_get}), no views, no time travel, no VGI table
+ * <p>v1 scope: read-only discovery of declarative/function-backed tables —
+ * both the legacy single-function scan path and genuinely multi-branch
+ * tables (function branches only; see {@link #resolveBranches} for what's
+ * refused) — with real multi-split parallel scans (see {@link
+ * farm.query.vgispark.scan.VgiScan}) and projection/filter/limit pushdown
+ * (see {@link farm.query.vgispark.scan.VgiScanBuilder}), plus a scoped
+ * subset of catalog scalar functions (see {@link VgiScalarFunctions} for
+ * exactly what's supported). No views, no time travel, no VGI table
  * functions (Spark has no SQL equivalent to Trino's {@code TABLE(...)}
- * syntax) — see the plan's phased delivery.
+ * syntax) — see {@code docs/ROADMAP.md} for what's next.
  */
 public final class VgiCatalog implements TableCatalog, SupportsNamespaces, FunctionCatalog {
 
@@ -175,15 +179,71 @@ public final class VgiCatalog implements TableCatalog, SupportsNamespaces, Funct
             throw new NoSuchTableException(ident);
         }
         TableInfo info = TableInfoDecoder.decode(tableResp.items().get(0));
+        List<VgiScanBranch> branches = resolveBranches(schemaName, tableName);
 
-        TableScanFunctionGetResponse scan = client.withConnection(a ->
-                a.service().catalog_table_scan_function_get(
-                        a.handle(), schemaName, tableName, null, null, null, null));
-        byte[] bindArguments = ScanFunctionArguments.toBindArguments(scan.arguments());
-
-        return new VgiTable(info.schema_name(), info.name(), scan.function_name(), bindArguments,
+        return new VgiTable(info.schema_name(), info.name(), branches,
                 info.columns(), info.cardinality_estimate(), null, null, info.required_filters(),
                 client, config);
+    }
+
+    /**
+     * Resolve a table's scan branches: try the multi-branch RPC first,
+     * falling back to the legacy single-function path on {@link
+     * MethodNotImplementedError} — mirrors the documented C++-extension
+     * client contract ("caches a per-attach capability and falls back... only
+     * when the worker raises method-not-implemented").
+     *
+     * <p>Refuses (fail closed, loudly — see {@link VgiScanBranch}'s own
+     * javadoc) rather than silently dropping or mis-scanning: a catalog-table
+     * or format branch (not yet supported — {@code docs/ROADMAP.md} tracks
+     * both as follow-up work), or any branch declaring a non-empty {@code
+     * branch_filter} (translating VGI's branch-filter grammar into a
+     * per-branch pushdown isn't wired up yet).
+     */
+    private List<VgiScanBranch> resolveBranches(String schemaName, String tableName) {
+        byte[] branchesResponse;
+        try {
+            branchesResponse = client.withConnection(a ->
+                    a.service().catalog_table_scan_branches_get(
+                            a.handle(), schemaName, tableName, null, null, null, null));
+        } catch (MethodNotImplementedError notMultiBranch) {
+            TableScanFunctionGetResponse scan = client.withConnection(a ->
+                    a.service().catalog_table_scan_function_get(
+                            a.handle(), schemaName, tableName, null, null, null, null));
+            byte[] bindArguments = ScanFunctionArguments.toBindArguments(scan.arguments());
+            return List.of(new VgiScanBranch(scan.function_name(), bindArguments));
+        }
+
+        ScanBranchesDecoder.Result decoded = ScanBranchesDecoder.decode(branchesResponse);
+        List<VgiScanBranch> branches = new ArrayList<>(decoded.branches().size());
+        for (int i = 0; i < decoded.branches().size(); i++) {
+            ScanBranchesDecoder.DecodedBranch branch = decoded.branches().get(i);
+            if (branch.kind() != ScanBranchesDecoder.DecodedBranch.Kind.FUNCTION) {
+                throw new UnsupportedOperationException("table '" + schemaName + "." + tableName
+                        + "': branch " + i + " is a " + branch.kind()
+                        + " branch, which vgi-spark doesn't support scanning yet (see docs/ROADMAP.md,"
+                        + " \"Multi-branch: format branches\") — only function branches are supported");
+            }
+            if (branch.branchFilter() != null && !branch.branchFilter().isBlank()) {
+                throw new UnsupportedOperationException("table '" + schemaName + "." + tableName
+                        + "': branch " + i + " (" + branch.functionName() + ") declares branch_filter '"
+                        + branch.branchFilter() + "', which vgi-spark doesn't translate into pushdown yet"
+                        + " (see docs/ROADMAP.md, the branch_filter note under \"Multi-branch: format"
+                        + " branches\") — refusing rather than silently scanning unfiltered");
+            }
+            byte[] bindArguments = ScanFunctionArguments.toBindArguments(branch.arguments());
+            branches.add(new VgiScanBranch(branch.functionName(), bindArguments));
+        }
+        if (branches.isEmpty()) {
+            // The table itself was already confirmed to exist (via
+            // catalog_table_get, above) — a worker declaring zero branches
+            // for it is an anomaly in the worker's own response, not "table
+            // not found," so this isn't NoSuchTableException (which is also
+            // a checked exception this private helper doesn't declare).
+            throw new IllegalStateException(
+                    "table '" + schemaName + "." + tableName + "': worker returned zero scan branches");
+        }
+        return branches;
     }
 
     @Override

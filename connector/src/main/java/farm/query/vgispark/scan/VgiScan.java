@@ -10,6 +10,7 @@ import farm.query.vgi.protocol.TableFunctionPlanRequest;
 import farm.query.vgirpc.marshal.RecordCodec;
 import farm.query.vgispark.VgiCatalogConfig;
 import farm.query.vgispark.VgiTable;
+import farm.query.vgispark.branch.VgiScanBranch;
 import farm.query.vgispark.client.VgiWorkerClient;
 import org.apache.spark.sql.connector.catalog.Column;
 import org.apache.spark.sql.connector.read.Batch;
@@ -108,9 +109,23 @@ public final class VgiScan implements Scan, Batch {
 
     @Override
     public InputPartition[] planInputPartitions() {
+        // Multi-branch: each branch is bound and planned independently, and
+        // every branch's partitions simply concatenate into one array — this
+        // falls out for free because a VgiInputPartition already carries its
+        // OWN bindCall/bindOpaqueData (never a scan-wide shared one), so nothing
+        // downstream (VgiPartitionReaderFactory/VgiPartitionReader) needs to
+        // know which branch a partition came from.
+        List<InputPartition> partitions = new ArrayList<>();
+        for (VgiScanBranch branch : table.branches()) {
+            partitions.addAll(planBranchPartitions(branch));
+        }
+        return partitions.toArray(new InputPartition[0]);
+    }
+
+    private List<InputPartition> planBranchPartitions(VgiScanBranch branch) {
         BindRequest bindRequest = new BindRequest(
-                table.scanFunctionName(),
-                table.scanFunctionArguments(),
+                branch.functionName(),
+                branch.scanFunctionArguments(),
                 "TABLE",
                 null,           // input_schema — producer-mode table function
                 null,           // settings
@@ -120,10 +135,10 @@ public final class VgiScan implements Scan, Batch {
                 false,          // resolved_secrets_provided
                 table.atUnit(), table.atValue(),
                 null, null,     // copy_from / copy_to
-                // NOT table.schemaName(): catalog_table_scan_function_get resolves a table's
-                // backing scan function, but doesn't say which schema that function itself is
-                // registered in — it can differ from the table's own schema. null lets the
-                // worker's dispatcher search every schema by name.
+                // NOT table.schemaName(): the scan function's own registered schema can
+                // differ from the table's schema (declarative tables) or is simply
+                // unknown for a branch (multi-branch). null lets the worker's
+                // dispatcher search every schema by name.
                 null);
 
         // withConnection's own attach handle must be the SAME one baked into
@@ -201,7 +216,7 @@ public final class VgiScan implements Scan, Batch {
             // safe to ignore rather than fan out further here.
             cursor = nextCursors.get(0);
         }
-        return partitions.toArray(new InputPartition[0]);
+        return partitions;
     }
 
     @Override

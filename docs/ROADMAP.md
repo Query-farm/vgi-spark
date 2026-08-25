@@ -42,7 +42,8 @@ here beyond rough estimates; rerun the sweep instead.
 ## Tier 1 — highest payoff, no new test infrastructure needed
 
 ### 1. Multi-branch tables (`catalog_table_scan_branches_get`)
-**Status:** ⬜ Not started
+**Status:** ✅ Done (function branches only — catalog-table, format, and
+`branch_filter`-bearing branches still refused, see below)
 
 The single biggest concentrated win, and the *only* way to get real declarative multi-split test
 coverage (see item 2's note) — `splits/multi_branch.test` reads a plain declarative table backed by
@@ -73,21 +74,42 @@ already shipped on the wire, per `~/Development/vgi-spark.md`).
 - `branch_filter` (a predicate scoping which rows a branch contributes) needs translating into the
   existing `VgiFilterTranslator` machinery or applying as a post-union `WHERE`.
 
-**Unlocks (verify via sweep after implementing):**
-- `splits/multi_branch.test` — real declarative multi-way split coverage, the #1 target.
-- `catalog/multi_branch_scan.test`, `multi_branch_capability_cache.test`, `multi_branch_empty_branches.test`,
-  `multi_branch_two_writable.test` (read portion) — no extra infra needed.
-- `catalog/multi_branch_format.test`, `multi_branch_heterogeneous.test`, `multi_branch_pushdown_incapable.test`,
-  `multi_branch_reconciliation.test` — need `VGI_TEST_BRANCH_DIR` env too (see test-infrastructure
-  gaps); function/catalog-table branch portions may still partially exercise without it.
-- NOT unlocked regardless: `multi_branch_join_optimizer.test`, `multi_branch_lateral.test` (DuckDB
-  C++ optimizer-internal regressions, no Catalyst analogue — see "Won't implement"),
+**What shipped:** `VgiCatalog.resolveBranches` tries `catalog_table_scan_branches_get` first,
+catching `MethodNotImplementedError` to fall back to the legacy single-function path (unmodified,
+zero regression risk — confirmed by the full existing test suite staying green). Decoding uses a
+new `ScanBranchesDecoder` (a first port of this wire shape for any JVM client — neither vgi-java's
+own client package nor vgi-trino had one), built field-for-field from the worker-side
+`ScanBranchesResultSerializer`'s own encode logic. `VgiTable.branches: List<VgiScanBranch>` replaced
+the single `scanFunctionName`/`scanFunctionArguments` fields (a one-element list for the legacy
+path); `VgiScan.planInputPartitions()` binds+plans each branch independently and concatenates their
+partitions — required **no change at all** to `VgiInputPartition`/`VgiPartitionReaderFactory`/
+`VgiPartitionReader`, since each partition already self-describes its own `bindCall`/
+`bindOpaqueData`. Catalog-table branches, format branches, and any branch declaring a non-empty
+`branch_filter` are refused with a clear, named error rather than silently mis-scanned.
+
+**Unlocks — verified:**
+- `splits/multi_branch.test` — **the #1 target, now a passing curated conformance test**
+  (`VgiSqlLogicTestConformanceTest.multiBranchSplitMatchesTheRealTestFile`), matching the real
+  file's exact expected sums (count=50, sum=625, distinct=30, max=29) including cross-branch filter
+  pushdown (`WHERE n >= 20` / `WHERE n < 20`) and a real 6-way split on the split-capable arm mixed
+  with the plain arm's sentinel path.
+- General sweep: +17 passing records after this change (405 → 422), from `catalog/multi_branch_*`
+  files gaining partial credit.
+
+**Still refused (tracked, not silently dropped):**
+- Catalog-table branches, format branches — `catalog/multi_branch_format.test`,
+  `multi_branch_heterogeneous.test`, etc. See item 11 below.
+- Any `branch_filter`-bearing branch — `catalog/multi_branch_filtered_numbers`-backed queries. See
+  item 11's own note.
+- NOT unlocked regardless of this item: `multi_branch_join_optimizer.test`, `multi_branch_lateral.test`
+  (DuckDB C++ optimizer-internal regressions, no Catalyst analogue — see "Won't implement"),
   `multi_branch_iceberg.test` (also needs `VGI_TEST_ICEBERG`), `multi_branch_writes_refused.test`
   (needs write support too).
 
-**Verification:** `docs/gap-notes/multi-branch.md` (create when starting) + rerun
-`VgiSqlLogicTestSweepTest`, check `catalog/multi_branch_*` and `splits/multi_branch.test` in the
-report.
+**Verification:** `connector/src/main/java/farm/query/vgispark/branch/` (`ScanBranchesDecoder`,
+`VgiScanBranch`), `VgiCatalog.resolveBranches`, `VgiScan.planBranchPartitions`. Tests:
+`VgiSqlLogicTestConformanceTest.multiBranchSplitMatchesTheRealTestFile` (curated, real file) +
+`VgiSqlLogicTestSweepTest` (general sweep, rerun for current numbers).
 
 ---
 
@@ -486,3 +508,5 @@ process. Worth adding to `VgiSqlLogicTestSweepTest`'s eligibility gate alongside
   `copy_from/copy_to/filter_pushdown/github/global_functions/http/launcher/macro/overload`, and
   `scalar/secret/settings/simple_writable/splits/table/table_in_out/view`) against the connector
   state as of commit `2c6ecc8` (end of the original 5-phase plan).
+- **2026-08-25** — Tier 1 item 1 (multi-branch tables, function branches only) done. `splits/multi_branch.test`
+  now passes as a curated conformance test; general sweep +17 records (405 → 422 passing).

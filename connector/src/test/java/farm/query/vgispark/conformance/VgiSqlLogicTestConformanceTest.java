@@ -162,4 +162,40 @@ class VgiSqlLogicTestConformanceTest {
         assertEquals(4, result.skipped(), "expected skip count changed — see WINDOW_SELF_JOIN_NON_PORTABLE_MARKERS");
         assertEquals(3, result.executed(), "expected executed-record count changed");
     }
+
+    /**
+     * {@code splits/multi_branch.test} — the one file in the whole 327-file
+     * corpus that exercises real split-plan machinery declaratively, with no
+     * table-function-call syntax needed at all (see {@code docs/ROADMAP.md},
+     * tier 1 item 1). Its fixture table has one split-capable arm ({@code
+     * split_sequence}, 30 rows over 6 splits) and one plain arm ({@code
+     * sequence}, 20 rows), unioned by {@code VgiCatalog}'s new multi-branch
+     * support. Non-portable: {@code ATTACH}/{@code DETACH}, DuckDB's {@code
+     * SET threads}/{@code RESET threads} (no Spark equivalent), {@code
+     * vgi_table_branches()} introspection, and the trailing query's {@code
+     * example.main.split_sequence(...)} table-function call (the Spark
+     * SQL-language ceiling — see the "Won't implement" section).
+     */
+    private static final List<String> MULTI_BRANCH_NON_PORTABLE_MARKERS = List.of(
+            "ATTACH ", "DETACH", "SET threads", "RESET threads", "vgi_table_branches()",
+            "example.main.split_sequence(");
+
+    @Test
+    @Timeout(180)
+    void multiBranchSplitMatchesTheRealTestFile() throws Exception {
+        Path testFile = VGI_TEST_ROOT.toPath().resolve("splits/multi_branch.test");
+        Assumptions.assumeTrue(testFile.toFile().isFile(), testFile + " not present");
+
+        SqlLogicTestRunner.Result result = SqlLogicTestRunner.run(spark, testFile,
+                "example.", SPARK_CATALOG, MULTI_BRANCH_NON_PORTABLE_MARKERS);
+
+        if (!result.failures().isEmpty()) {
+            fail(result.executed() + " executed, " + result.skipped() + " skipped, "
+                    + result.failures().size() + " FAILED:\n" + String.join("\n---\n", result.failures()));
+        }
+        // 7 non-portable: ATTACH, SET threads, RESET threads, 2x vgi_table_branches(), the
+        // UNION ALL table-function-call query, DETACH.
+        assertEquals(7, result.skipped(), "expected skip count changed — see MULTI_BRANCH_NON_PORTABLE_MARKERS");
+        assertEquals(5, result.executed(), "expected executed-record count changed");
+    }
 }
