@@ -39,6 +39,13 @@ import java.util.Set;
  *        for a plain (non-time-travel) read
  * @param atValue the resolved AT clause's value, or {@code null} exactly when
  *        {@code atUnit} is {@code null} (VGI requires both or neither)
+ * @param requiredFilters required WHERE-filter groups in conjunctive normal
+ *        form ({@code TableInfo.required_filters}: an AND of OR-groups, each
+ *        inner group a list of dotted column paths satisfied when any one of
+ *        its paths has a filter pushed). Empty means no enforcement. See
+ *        {@code VgiScanBuilder} for where this is checked, fail-closed,
+ *        against whatever {@code VgiFilterTranslator} actually manages to
+ *        push — not merely what appears in the WHERE clause
  * @param client the pooled connection to this catalog's VGI worker, used for
  *        this table's own bind+plan (driver-side only — see {@code VgiPartitionReader}
  *        for how executors get their own, unpooled connection)
@@ -53,6 +60,7 @@ public record VgiTable(
         Long cardinalityEstimate,
         String atUnit,
         String atValue,
+        java.util.List<java.util.List<String>> requiredFilters,
         VgiWorkerClient client,
         VgiCatalogConfig config) implements Table, SupportsRead {
 
@@ -94,14 +102,20 @@ public record VgiTable(
         return new VgiScanBuilder(client, config, this);
     }
 
-    /** @return this table's columns, indexed by wire field name (not display name) to ordinal. */
-    public java.util.Map<String, Integer> ordinalsByWireName() {
+    /**
+     * @return this table's columns, indexed by SQL-facing display name (see
+     *         {@code VgiColumnNames#displayName}) to ordinal in the full
+     *         Arrow schema — the lookup {@code SupportsPushDownRequiredColumns}
+     *         and filter pushdown both need, since Spark refers to columns
+     *         by the name it sees, not the wire field name
+     */
+    public java.util.Map<String, Integer> ordinalsByDisplayName() {
         Schema arrow = outputSchema();
         java.util.Map<String, Integer> out = new java.util.LinkedHashMap<>();
         if (arrow == null) return out;
         java.util.List<Field> fields = arrow.getFields();
         for (int i = 0; i < fields.size(); i++) {
-            out.put(fields.get(i).getName(), i);
+            out.put(VgiColumnNames.displayName(fields.get(i)), i);
         }
         return out;
     }

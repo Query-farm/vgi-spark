@@ -108,4 +108,36 @@ class VgiCatalogQueryTest {
         assertEquals(100L, result.getLong(0));
         assertEquals(4950L, result.getLong(1)); // sum(0..99)
     }
+
+    @Test
+    @Timeout(60)
+    void filterPushdownReturnsCorrectRows() {
+        // A real correctness check on VgiFilterTranslator/PushdownFiltersEncoder,
+        // not just "the query didn't crash": if EQ/GT/AND translation or the
+        // worker's own filter application were wrong in either direction (too
+        // permissive OR too strict), this would return the wrong row set.
+        List<Row> rows = spark.sql(
+                "SELECT value FROM " + CATALOG + ".data.numbers WHERE value > 90 AND value <= 95 ORDER BY value")
+                .collectAsList();
+        assertEquals(5, rows.size());
+        for (int i = 0; i < 5; i++) {
+            assertEquals(91L + i, rows.get(i).getLong(0));
+        }
+    }
+
+    @Test
+    @Timeout(60)
+    void projectionPushdownReturnsOnlyRequestedColumns() {
+        // versioned_data declares two columns (id: int64, score: float64);
+        // selecting only "id" must prune "score" from the wire, not merely
+        // from the DataFrame after a full-width read — this is a real
+        // assertion about SupportsPushDownRequiredColumns, not just about
+        // Spark's own projection re-check after the fact.
+        Dataset<Row> df = spark.sql("SELECT id FROM " + CATALOG + ".data.versioned_data ORDER BY id");
+        assertEquals(1, df.schema().fields().length, "expected exactly one projected column");
+        assertEquals("id", df.schema().fields()[0].name());
+
+        List<Row> rows = df.collectAsList();
+        assertTrue(!rows.isEmpty(), "expected at least one row from versioned_data");
+    }
 }

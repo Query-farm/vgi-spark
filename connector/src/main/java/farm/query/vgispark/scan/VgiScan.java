@@ -47,24 +47,46 @@ public final class VgiScan implements Scan, Batch {
     private final VgiWorkerClient client;
     private final VgiCatalogConfig config;
     private final VgiTable table;
+    private final List<Integer> projectionIds;
+    private final byte[] pushdownFiltersBytes;
+    private final Long rowLimit;
     private final StructType readSchema;
 
     /**
      * @param client the pooled connection to this catalog's VGI worker
      * @param config this catalog's configuration
      * @param table the table being scanned
+     * @param projectionIds the columns to project, as ordinals into the
+     *        table's full Arrow schema, in ascending order, or {@code null}
+     *        for all of them
+     * @param pushdownFiltersBytes the encoded {@code InitRequest.pushdown_filters}/
+     *        {@code TableFunctionPlanRequest.pushdown_filters} batch, or
+     *        {@code null} if nothing was pushed
+     * @param rowLimit a fetch-limit hint pushed to every split, or {@code null}
      */
-    public VgiScan(VgiWorkerClient client, VgiCatalogConfig config, VgiTable table) {
+    public VgiScan(VgiWorkerClient client, VgiCatalogConfig config, VgiTable table,
+            List<Integer> projectionIds, byte[] pushdownFiltersBytes, Long rowLimit) {
         this.client = client;
         this.config = config;
         this.table = table;
-        // Built from table.columns() directly rather than the deprecated
-        // Table.schema() — see VgiTable's own note on why columns() is the
-        // source of truth as of Spark 4.x.
+        this.projectionIds = projectionIds;
+        this.pushdownFiltersBytes = pushdownFiltersBytes;
+        this.rowLimit = rowLimit;
+        // Built from table.columns() + projectionIds directly, in ordinal
+        // order — NOT from prunedSchema's own (Spark-chosen, not necessarily
+        // ordinal) field order — because VgiPartitionReader emits columns in
+        // exactly this same ordinal order (see its own use of projectionIds),
+        // and the two must never disagree about which column is where.
         Column[] columns = table.columns();
-        StructField[] fields = new StructField[columns.length];
-        for (int i = 0; i < columns.length; i++) {
-            fields[i] = DataTypes.createStructField(columns[i].name(), columns[i].dataType(), columns[i].nullable());
+        List<Integer> ordinals = projectionIds;
+        if (ordinals == null) {
+            ordinals = new ArrayList<>(columns.length);
+            for (int i = 0; i < columns.length; i++) ordinals.add(i);
+        }
+        StructField[] fields = new StructField[ordinals.size()];
+        for (int i = 0; i < ordinals.size(); i++) {
+            Column c = columns[ordinals.get(i)];
+            fields[i] = DataTypes.createStructField(c.name(), c.dataType(), c.nullable());
         }
         this.readSchema = DataTypes.createStructType(fields);
     }
@@ -136,10 +158,10 @@ public final class VgiScan implements Scan, Batch {
             int cap = Math.max(1, config.maxSplitsPerResponse());
             TableFunctionPlanRequest request = new TableFunctionPlanRequest(
                     bindCall, bindOpaqueData,
-                    null,           // projection_ids — not wired yet
-                    null,           // pushdown_filters — not wired yet
+                    projectionIds,
+                    pushdownFiltersBytes,
                     null,           // join_keys
-                    null,           // row_limit — not wired yet
+                    rowLimit,
                     config.targetSplitBytes(),
                     config.minSplits(),
                     (long) cap,
@@ -184,7 +206,8 @@ public final class VgiScan implements Scan, Batch {
 
     @Override
     public PartitionReaderFactory createReaderFactory() {
-        return new VgiPartitionReaderFactory(config, table.outputSchemaBytes(), null);
+        return new VgiPartitionReaderFactory(
+                config, table.outputSchemaBytes(), projectionIds, pushdownFiltersBytes, rowLimit);
     }
 
     private static BindRequest withAttachHandle(BindRequest request, byte[] attachHandle) {

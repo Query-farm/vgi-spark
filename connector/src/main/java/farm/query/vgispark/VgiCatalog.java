@@ -175,7 +175,8 @@ public final class VgiCatalog implements TableCatalog, SupportsNamespaces {
         byte[] bindArguments = ScanFunctionArguments.toBindArguments(scan.arguments());
 
         return new VgiTable(info.schema_name(), info.name(), scan.function_name(), bindArguments,
-                info.columns(), info.cardinality_estimate(), null, null, client, config);
+                info.columns(), info.cardinality_estimate(), null, null, info.required_filters(),
+                client, config);
     }
 
     @Override

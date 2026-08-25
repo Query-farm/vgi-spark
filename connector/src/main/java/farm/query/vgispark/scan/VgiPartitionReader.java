@@ -74,11 +74,14 @@ public final class VgiPartitionReader implements PartitionReader<ColumnarBatch> 
      * @param tableOutputSchemaBytes the owning table's full (bind-time) Arrow
      *        schema, IPC-encoded
      * @param projectionIds the columns to project, as ordinals into the full
-     *        schema, or {@code null} for all of them (v1: always {@code null}
-     *        — projection pushdown is a later phase)
+     *        schema, or {@code null} for all of them
+     * @param pushdownFiltersBytes the encoded {@code InitRequest.pushdown_filters}
+     *        batch, or {@code null} — informational/best-effort only, never
+     *        trusted as exactly applied (see {@code VgiScanBuilder})
+     * @param rowLimit a fetch-limit hint this split may stop at, or {@code null}
      */
-    public VgiPartitionReader(VgiCatalogConfig config, VgiInputPartition partition,
-            byte[] tableOutputSchemaBytes, List<Integer> projectionIds) {
+    public VgiPartitionReader(VgiCatalogConfig config, VgiInputPartition partition, byte[] tableOutputSchemaBytes,
+            List<Integer> projectionIds, byte[] pushdownFiltersBytes, Long rowLimit) {
         this.arrowSchema = ArrowSchemaCodec.deserializeSchema(tableOutputSchemaBytes);
         this.projectionIds = projectionIds;
         this.connection = VgiWorkerClient.connect(config);
@@ -89,7 +92,7 @@ public final class VgiPartitionReader implements PartitionReader<ColumnarBatch> 
                     tableOutputSchemaBytes,
                     partition.bindOpaqueData(),
                     projectionIds,
-                    null,           // pushdown_filters — not wired yet
+                    pushdownFiltersBytes,
                     null,           // join_keys
                     null,           // phase (producer mode)
                     null,           // execution_id — primary init, worker mints one
@@ -99,7 +102,7 @@ public final class VgiPartitionReader implements PartitionReader<ColumnarBatch> 
                     null,           // finalize_state_id
                     null,           // substream_id
                     partition.token().length == 0 ? null : List.of(partition.token()),
-                    null);          // row_limit — not wired yet
+                    rowLimit);
             this.session = connection.service().init(initRequest, null);
             ok = true;
         } finally {

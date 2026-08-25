@@ -27,18 +27,28 @@ public final class VgiPartitionReaderFactory implements PartitionReaderFactory {
     private final VgiCatalogConfig config;
     private final byte[] tableOutputSchemaBytes;
     private final List<Integer> projectionIds;
+    private final byte[] pushdownFiltersBytes;
+    private final Long rowLimit;
 
     /**
      * @param config this catalog's configuration
      * @param tableOutputSchemaBytes the table's full (bind-time) Arrow schema, IPC-encoded
      * @param projectionIds the columns to project, as ordinals into the full
      *        schema, or {@code null} for all of them
+     * @param pushdownFiltersBytes the encoded {@code InitRequest.pushdown_filters}
+     *        batch, or {@code null} if nothing was pushed — the same bytes
+     *        every split's {@code init()} receives, informational/best-effort
+     *        only (see {@code VgiScanBuilder}'s own javadoc)
+     * @param rowLimit a fetch-limit hint pushed to every split's {@code init()},
+     *        or {@code null}
      */
-    public VgiPartitionReaderFactory(
-            VgiCatalogConfig config, byte[] tableOutputSchemaBytes, List<Integer> projectionIds) {
+    public VgiPartitionReaderFactory(VgiCatalogConfig config, byte[] tableOutputSchemaBytes,
+            List<Integer> projectionIds, byte[] pushdownFiltersBytes, Long rowLimit) {
         this.config = config;
         this.tableOutputSchemaBytes = tableOutputSchemaBytes;
         this.projectionIds = projectionIds;
+        this.pushdownFiltersBytes = pushdownFiltersBytes;
+        this.rowLimit = rowLimit;
     }
 
     @Override
@@ -57,7 +67,7 @@ public final class VgiPartitionReaderFactory implements PartitionReaderFactory {
 
     @Override
     public PartitionReader<ColumnarBatch> createColumnarReader(InputPartition partition) {
-        return new VgiPartitionReader(
-                config, (VgiInputPartition) partition, tableOutputSchemaBytes, projectionIds);
+        return new VgiPartitionReader(config, (VgiInputPartition) partition, tableOutputSchemaBytes,
+                projectionIds, pushdownFiltersBytes, rowLimit);
     }
 }
