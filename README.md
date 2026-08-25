@@ -15,6 +15,11 @@ spark.conf.set("spark.sql.catalog.vgi_example.catalog-name", "example")
 spark.sql("SELECT * FROM vgi_example.data.numbers").show()
 ```
 
+**Conformance roadmap:** [`docs/ROADMAP.md`](docs/ROADMAP.md) tracks, feature by feature, what's
+needed to pass more of the real `~/Development/vgi/test/sql/integration/` sqllogictest suite —
+what's done, what's next, what's a real gap vs. a Spark SQL-language ceiling we can't cross, and
+exactly which `.test` files each item unlocks.
+
 ## Status
 
 All five phases of the original plan are implemented and verified against
