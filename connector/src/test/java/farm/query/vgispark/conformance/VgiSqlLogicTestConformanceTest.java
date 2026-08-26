@@ -583,4 +583,45 @@ class VgiSqlLogicTestConformanceTest {
         assertEquals(28, result.skipped(), "expected skip count changed — see SUM_VALUES_NON_PORTABLE_MARKERS");
         assertEquals(53, result.executed(), "expected executed-record count changed");
     }
+
+    /**
+     * {@code overload/scalar_overload.test} (roadmap tier 2 item 9): {@code
+     * format_number} (3 overloads, arity-only dispatch), {@code type_info}
+     * (5 overloads — 3 reachable from Spark — single-argument type dispatch,
+     * including the int64/uint32/uint64-collide-on-{@code LongType}
+     * tie-break), {@code smart_format} ({@code ConstParam} type dispatch at
+     * a fixed arity), {@code pair_type} (two-argument type dispatch, 3
+     * overloads), and {@code any_mixed} ({@code any}-typed first argument +
+     * fixed-type second argument dispatch) — all live against
+     * {@code VgiOverloadedScalarFunction}. Non-portable: {@code ATTACH}/
+     * {@code DETACH}; {@code FROM example.sequence(...)} (a VGI TABLE
+     * function called via {@code FROM func(...)}, confirmed structurally
+     * unreachable from Spark — see the "Won't implement" section); {@code
+     * typeof(...)} (the pre-existing casing gap, 7b/7c/7d); and {@code
+     * type_info}'s {@code ::UINTEGER}/{@code ::UBIGINT} records (Spark can't
+     * even parse that cast syntax — the same unsigned-integer ceiling as
+     * {@code numeric_promotion.test}, 7b); and {@code ::VARCHAR} with no
+     * length (DuckDB allows an unparameterized {@code VARCHAR}; Spark's
+     * parser requires {@code VARCHAR(n)} — a general DuckDB-vs-Spark syntax
+     * gap, unrelated to overload resolution itself).
+     */
+    private static final List<String> SCALAR_OVERLOAD_NON_PORTABLE_MARKERS = List.of(
+            "ATTACH ", "DETACH", "example.sequence(", "typeof(", "UINTEGER", "UBIGINT", "::VARCHAR");
+
+    @Test
+    @Timeout(180)
+    void scalarOverloadMatchesTheRealTestFile() throws Exception {
+        Path testFile = VGI_TEST_ROOT.toPath().resolve("overload/scalar_overload.test");
+        Assumptions.assumeTrue(testFile.toFile().isFile(), testFile + " not present");
+
+        SqlLogicTestRunner.Result result = SqlLogicTestRunner.run(spark, testFile,
+                "example.", SPARK_CATALOG, SCALAR_OVERLOAD_NON_PORTABLE_MARKERS);
+
+        if (!result.failures().isEmpty()) {
+            fail(result.executed() + " executed, " + result.skipped() + " skipped, "
+                    + result.failures().size() + " FAILED:\n" + String.join("\n---\n", result.failures()));
+        }
+        assertEquals(20, result.skipped(), "expected skip count changed — see SCALAR_OVERLOAD_NON_PORTABLE_MARKERS");
+        assertEquals(26, result.executed(), "expected executed-record count changed");
+    }
 }

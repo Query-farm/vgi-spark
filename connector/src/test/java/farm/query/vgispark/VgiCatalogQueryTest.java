@@ -625,4 +625,37 @@ class VgiCatalogQueryTest {
         assertEquals(24L, rows.get(1).getLong(0));
         assertEquals(true, rows.get(2).isNullAt(0));
     }
+
+    @Test
+    @Timeout(60)
+    void scalarFunctionDispatchesOverloadsByArity() {
+        // format_number(value) / format_number(precision, value) /
+        // format_number(precision, prefix, value) — roadmap item 9: three
+        // FunctionInfo entries share the name "format_number", distinguished
+        // only by arity — VgiOverloadedScalarFunction.bind's arity-filter
+        // path (no type ambiguity to resolve here).
+        assertEquals("3", spark.sql("SELECT " + CATALOG + ".format_number(3.14) AS r")
+                .collectAsList().get(0).getString(0));
+        assertEquals("3.14", spark.sql("SELECT " + CATALOG + ".format_number(2, 3.14159) AS r")
+                .collectAsList().get(0).getString(0));
+        assertEquals("$3.14", spark.sql("SELECT " + CATALOG + ".format_number(2, '$', 3.14) AS r")
+                .collectAsList().get(0).getString(0));
+    }
+
+    @Test
+    @Timeout(60)
+    void scalarFunctionDispatchesOverloadsByArgumentType() {
+        // type_info(v) — roadmap item 9: five FunctionInfo entries share the
+        // name "type_info", all arity 1, distinguished only by the single
+        // argument's TYPE — VgiOverloadedScalarFunction.bind's type-filter
+        // path. (UINTEGER/UBIGINT overloads are unreachable from Spark at
+        // all — no unsigned integer type exists to cast into — so only the
+        // int32/int64/varchar overloads are exercised here.)
+        assertEquals("int32", spark.sql("SELECT " + CATALOG + ".type_info(42::INT) AS r")
+                .collectAsList().get(0).getString(0));
+        assertEquals("int64", spark.sql("SELECT " + CATALOG + ".type_info(42::BIGINT) AS r")
+                .collectAsList().get(0).getString(0));
+        assertEquals("varchar", spark.sql("SELECT " + CATALOG + ".type_info('hello') AS r")
+                .collectAsList().get(0).getString(0));
+    }
 }

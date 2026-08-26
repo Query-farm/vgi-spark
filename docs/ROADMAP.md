@@ -572,17 +572,50 @@ Catalyst-internal representation for a spatial bounding box to convert into safe
 ---
 
 ### 9. Scalar function overload resolution (ConstParam / any-typed / vararg dispatch)
-**Status:** ⬜ Not started — depends on 7c/7d above
+**Status:** ✅ Done (arity + fixed-argument-type dispatch; vararg-vs-vararg type dispatch not
+covered — see below)
 
-**What it is:** today `VgiScalarFunctions.loadFunction` resolves exactly one `FunctionInfo` per
-name. VGI allows multiple overloads of the same name distinguished by const-argument count/type,
-column-argument type, or vararg element type. Spark's `UnboundFunction.bind(StructType)` already
-receives the call site's concrete argument types (and, per 7c, could receive const values too) —
-architecturally this is plausible (not a Spark-SPI ceiling, confirmed by the survey), it just needs
-`loadFunction`/`bind` to consider every same-named `FunctionInfo` and pick the best match instead of
-assuming one.
+**What shipped:** `VgiScalarFunctions.loadFunction` now collects EVERY `FunctionInfo` sharing a
+name (previously: silently returned the first) and, when there's more than one, hands back a new
+`VgiOverloadedScalarFunction` — its `bind(StructType)` is the one point Spark hands over a call
+site's real arity and argument types, so all dispatch logic lives there: filter candidates by arity
+(`callArity == declaredCount`, or `>= declaredCount - 1` for a trailing vararg candidate — 7d),
+then by per-FIXED-position type (an `any`-typed position, or a call-site `NullType` bare-`NULL`
+literal, always matches). Two-tier type matching — EXACT equality first; only if that yields zero
+candidates, retried with a narrow implicit-numeric-widening check (Spark's own DECIMAL-literal
+default type against a `DOUBLE`-declared overload, confirmed live necessary against
+`format_number(3.14)`; plain byte→short→int→long widening) — so an exact match always beats a
+widened one, standard SQL overload-resolution shape. A genuine Arrow-type COLLISION (int64/uint32/
+uint64 all widen to Spark's one `LongType` — no unsigned integer type exists to keep them apart, the
+same ceiling `VgiTypeMapping`'s own javadoc documents) is tie-broken by preferring whichever
+candidate(s) use no UNSIGNED Arrow int at any position — mirroring vgi-trino's own "prefer the
+lossless mapping" tie-break for the identical collision, and the natural default since Spark has no
+literal syntax to ever express "this is specifically unsigned." Zero matches, or more than one
+surviving the tie-break, throws a clear, specific error — never a silent, possibly-wrong pick.
+`VgiScalarFunctions.listFunctions` now dedupes an overloaded name to one `Identifier`.
 
-**Unlocks:** `overload/scalar_overload.test`, `scalar_varargs_overload.test` — **2 files**.
+**Known gap, found live, not pursued:** disambiguating BETWEEN TWO VARARG overloads of the same
+name by their element type (e.g. `concat_values`'s int-column and string-column overloads, both
+declared arity `1+`) isn't covered — the vararg tail is deliberately never a dispatch criterion
+here (its individual positions are resolved independently, later, inside `VgiUnboundScalarFunction
+.bind`, only after ONE overload has already been chosen), so `concat_values(1, 2)` and
+`concat_values('a', 'b')` both report "ambiguous — 2 overloads match" rather than picking correctly.
+Real SQL-standard overload resolution would need to peek at the vararg-expanded elements' actual
+types during CANDIDATE SELECTION itself, a genuinely bigger scope than the fixed-argument case this
+item otherwise fully covers — confirmed via the general sweep (`overload/scalar_varargs_overload
+.test`), not assumed; left as a documented limitation rather than a silent gap.
+
+**Unlocks:** `overload/scalar_overload.test` as a curated conformance test (26/46 records; non-
+portable: `ATTACH`/`DETACH`, `FROM example.sequence(...)` — a VGI table function called via
+`FROM func(...)`, confirmed structurally unreachable from Spark, see "Won't implement" — `typeof(...)`
+casing, `type_info`'s `::UINTEGER`/`::UBIGINT` unsigned-cast ceiling, and `::VARCHAR` with no length
+— DuckDB allows an unparameterized `VARCHAR`, Spark's parser requires `VARCHAR(n)`). Does NOT unlock
+`scalar_varargs_overload.test` — see the known gap above.
+
+**Verification:** new `VgiOverloadedScalarFunction` (package `farm.query.vgispark.function`); 2 new
+live `VgiCatalogQueryTest` regressions (`scalarFunctionDispatchesOverloadsByArity`,
+`scalarFunctionDispatchesOverloadsByArgumentType`); `VgiSqlLogicTestConformanceTest
+.scalarOverloadMatchesTheRealTestFile` (curated, real file).
 
 ---
 
@@ -964,3 +997,12 @@ process. Worth adding to `VgiSqlLogicTestSweepTest`'s eligibility gate alongside
   substituted with a safe placeholder type rather than refused, since the wire cell is null either
   way. Full `./gradlew :connector:test` green (56/56). Sweep: 659 → 715 passing records, 19 → 20
   files fully passing.
+- **2026-08-26** — Tier 2 item 9 (scalar function overload resolution) done — arity + fixed-argument
+  -type dispatch, with a two-tier exact-then-implicit-widening match and an unsigned-collision
+  tie-break (mirroring vgi-trino's own). New `VgiOverloadedScalarFunction`; `VgiScalarFunctions
+  .loadFunction`/`.listFunctions` updated to collect every same-named `FunctionInfo` instead of
+  returning the first. Known, documented gap: two VARARG overloads of the same name can't be
+  disambiguated by element type (`concat_values`) — the vararg tail is never a dispatch criterion,
+  found live via the sweep, not pursued further (a genuinely bigger scope than this item's otherwise
+  full fixed-argument coverage). Full `./gradlew :connector:test` green (59/59). Sweep: 715 → 725
+  passing records.

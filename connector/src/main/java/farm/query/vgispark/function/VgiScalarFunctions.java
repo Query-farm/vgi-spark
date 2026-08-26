@@ -44,7 +44,11 @@ public final class VgiScalarFunctions {
         String schemaName = namespace[0];
         ItemsResponse resp = client.withConnection(a -> a.service()
                 .catalog_schema_contents_functions(a.handle(), schemaName, "SCALAR_FUNCTION", null, null));
-        List<Identifier> out = new ArrayList<>(resp.items().size());
+        // A java.util.LinkedHashSet-backed dedupe: an overloaded name (item 9)
+        // has multiple FunctionInfo entries but should appear exactly once in
+        // a listing (SHOW FUNCTIONS-style introspection), same as any other
+        // catalog's function listing never repeats an overloaded name.
+        java.util.LinkedHashSet<Identifier> out = new java.util.LinkedHashSet<>(resp.items().size());
         for (byte[] item : resp.items()) {
             FunctionInfo info = RecordCodec.deserializeFromBytes(item, FunctionInfo.class);
             out.add(Identifier.of(new String[] {schemaName}, info.name()));
@@ -65,15 +69,20 @@ public final class VgiScalarFunctions {
      *        catalog-then-name resolution hands {@code loadFunction} an
      *        Identifier with a zero-length namespace, not one naming the
      *        schema)
-     * @return the unbound function
+     * @return the unbound function — if more than one {@code FunctionInfo}
+     *         shares this name (item 9: overload resolution, e.g. dispatch
+     *         by {@code ConstParam} count or by argument type), a {@link
+     *         VgiOverloadedScalarFunction} that defers picking the single
+     *         matching candidate to {@code bind(StructType)}, the earliest
+     *         point the call site's real arity/types are known
      * @throws NoSuchFunctionException if no scalar function of that name
      *         exists in that schema
-     * @throws UnsupportedOperationException if the function exists but its
-     *         shape isn't supported yet (see {@code VgiUnboundScalarFunction}'s
-     *         own validation) — thrown rather than reported as "not found",
-     *         since the caller asked for this exact function by name and
-     *         deserves to know why it can't be called, not a misleading
-     *         "does not exist"
+     * @throws UnsupportedOperationException if exactly one function of that
+     *         name exists but its shape isn't supported yet (see {@code
+     *         VgiUnboundScalarFunction}'s own validation) — thrown rather
+     *         than reported as "not found", since the caller asked for this
+     *         exact function by name and deserves to know why it can't be
+     *         called, not a misleading "does not exist"
      */
     public static UnboundFunction loadFunction(VgiWorkerClient client, VgiCatalogConfig config, Identifier ident)
             throws NoSuchFunctionException {
@@ -88,12 +97,13 @@ public final class VgiScalarFunctions {
         String functionName = ident.name();
         ItemsResponse resp = client.withConnection(a -> a.service()
                 .catalog_schema_contents_functions(a.handle(), schemaName, "SCALAR_FUNCTION", null, null));
+        List<FunctionInfo> matches = new ArrayList<>();
         for (byte[] item : resp.items()) {
             FunctionInfo info = RecordCodec.deserializeFromBytes(item, FunctionInfo.class);
-            if (info.name().equalsIgnoreCase(functionName)) {
-                return VgiUnboundScalarFunction.tryBuild(client, config, schemaName, info);
-            }
+            if (info.name().equalsIgnoreCase(functionName)) matches.add(info);
         }
-        throw new NoSuchFunctionException(ident);
+        if (matches.isEmpty()) throw new NoSuchFunctionException(ident);
+        if (matches.size() == 1) return VgiUnboundScalarFunction.tryBuild(client, config, schemaName, matches.get(0));
+        return new VgiOverloadedScalarFunction(client, config, schemaName, matches);
     }
 }
