@@ -441,4 +441,66 @@ class VgiSqlLogicTestConformanceTest {
         assertEquals(65, result.skipped(), "expected skip count changed — see COLUMN_STATISTICS_NON_PORTABLE_MARKERS");
         assertEquals(9, result.executed(), "expected executed-record count changed");
     }
+
+    /**
+     * {@code aggregate/basic.test} (roadmap tier 1 item 2): plain ungrouped
+     * {@code vgi_sum}/{@code vgi_count}/{@code vgi_avg} calls, NULL handling,
+     * an empty-table case, and a byte-equal-state regression — all real
+     * {@code AggregateFunction} round trips against a live worker. Every
+     * {@code range(...)} call is Spark's OWN built-in table-valued function,
+     * not a VGI one, so those need no marker. Non-portable: {@code ATTACH}/
+     * {@code DETACH}, and the one window-aggregate record ({@code OVER (...)})
+     * — VGI aggregate windowed-frame support needs a materially different RPC
+     * surface (Spark's {@code PartitionEvaluator} SPI), explicitly out of
+     * v1 scope (see {@code docs/ROADMAP.md} item 2's own "Explicitly
+     * deferred" list) — confirmed by actually running it, not assumed.
+     */
+    private static final List<String> AGGREGATE_BASIC_NON_PORTABLE_MARKERS =
+            List.of("ATTACH ", "DETACH", "OVER (ORDER BY i ROWS BETWEEN");
+
+    @Test
+    @Timeout(180)
+    void aggregateBasicMatchesTheRealTestFile() throws Exception {
+        Path testFile = VGI_TEST_ROOT.toPath().resolve("aggregate/basic.test");
+        Assumptions.assumeTrue(testFile.toFile().isFile(), testFile + " not present");
+
+        SqlLogicTestRunner.Result result = SqlLogicTestRunner.run(spark, testFile,
+                "example.", SPARK_CATALOG, AGGREGATE_BASIC_NON_PORTABLE_MARKERS);
+
+        if (!result.failures().isEmpty()) {
+            fail(result.executed() + " executed, " + result.skipped() + " skipped, "
+                    + result.failures().size() + " FAILED:\n" + String.join("\n---\n", result.failures()));
+        }
+        assertEquals(3, result.skipped(), "expected skip count changed — see AGGREGATE_BASIC_NON_PORTABLE_MARKERS");
+        assertEquals(12, result.executed(), "expected executed-record count changed");
+    }
+
+    /**
+     * {@code aggregate/grouped.test}: real {@code GROUP BY} — multiple groups
+     * within one task, exercising {@code VgiAggregateFunction}'s per-group
+     * bind-once/update/finalize/destructor sequence repeatedly, up to 100
+     * groups over 1000 rows in its last record. {@code SET threads=1} is
+     * DuckDB's own pragma — Spark's generic {@code SET} accepts any key as a
+     * harmless string property (same permissive behavior settings passthrough,
+     * item 6, already relies on), so it executes as a no-op rather than
+     * needing a skip marker.
+     */
+    private static final List<String> AGGREGATE_GROUPED_NON_PORTABLE_MARKERS = List.of("ATTACH ", "DETACH");
+
+    @Test
+    @Timeout(180)
+    void aggregateGroupedMatchesTheRealTestFile() throws Exception {
+        Path testFile = VGI_TEST_ROOT.toPath().resolve("aggregate/grouped.test");
+        Assumptions.assumeTrue(testFile.toFile().isFile(), testFile + " not present");
+
+        SqlLogicTestRunner.Result result = SqlLogicTestRunner.run(spark, testFile,
+                "example.", SPARK_CATALOG, AGGREGATE_GROUPED_NON_PORTABLE_MARKERS);
+
+        if (!result.failures().isEmpty()) {
+            fail(result.executed() + " executed, " + result.skipped() + " skipped, "
+                    + result.failures().size() + " FAILED:\n" + String.join("\n---\n", result.failures()));
+        }
+        assertEquals(2, result.skipped(), "expected skip count changed — see AGGREGATE_GROUPED_NON_PORTABLE_MARKERS");
+        assertEquals(5, result.executed(), "expected executed-record count changed");
+    }
 }

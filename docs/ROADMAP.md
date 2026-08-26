@@ -114,7 +114,7 @@ partitions — required **no change at all** to `VgiInputPartition`/`VgiPartitio
 ---
 
 ### 2. Catalog aggregate functions (`AggregateFunction`)
-**Status:** ⬜ Not started
+**Status:** ✅ Done — the last Tier 1 item; all of Tier 1 is now complete
 
 **What it is:** Spark's `org.apache.spark.sql.connector.catalog.functions.AggregateFunction<S
 extends Serializable, R>` — `newAggregationState()`, `update(S, InternalRow)`, `merge(S, S)`,
@@ -125,34 +125,74 @@ RPC call updates many groups' state at once via a `group_ids_batch`, matching Du
 hash-aggregate model. Spark's SPI is the opposite granularity — `update()` is called once per row
 within one group's local Catalyst-managed state.
 
-**Design (avoids "one RPC per row," which would be unusable):** don't call the worker from
-`update()`/`merge()` at all — buffer raw input rows into `S` (a growing local list/Arrow-batch
-buffer; `merge()` is then just list concatenation, safe because we haven't asked the worker to
-compute anything yet). Only at `produceResult(S)` — called once per group — do the real RPC calls:
-`aggregate_bind` (cacheable across groups within one query, same one-time-bind pattern as
-`VgiUnboundScalarFunction`), `aggregate_update` with the whole buffered batch, `aggregate_finalize`
-for this one group, `aggregate_destructor` to release it. Cost is one worker round-trip **per
-group**, not per row — reasonable for typical `GROUP BY` cardinalities.
+**What shipped:** exactly the design sketched above. New `VgiAggregateFunctions`/
+`VgiUnboundAggregateFunction`/`VgiAggregateFunction`/`VgiAggState` classes (package `farm.query
+.vgispark.function`, alongside the scalar-function ones — `VgiCatalog.loadFunction` now tries scalar
+first, falling back to aggregate on a scalar miss, since Spark's `FunctionCatalog` has one lookup for
+both kinds). `update()`/`merge()` do no RPC at all — `VgiAggState` just buffers `InternalRow.copy()`s
+and concatenates on merge. `produceResult()` does the real work: `aggregate_bind` lazily on the FIRST
+group a given Spark TASK processes (mirroring `VgiScalarFunction`'s own lazy-per-task-unpooled-
+connection pattern exactly, `TaskContext` completion listener included — `execution_id` is scoped to
+one connection, and `UnboundFunction.bind(StructType)` runs on the driver, long before any task-owned
+connection exists), then per group: `aggregate_update` (the whole buffered batch, a `__vgi_group_id`
+column stamped with a locally-invented, per-instance-counter group id — every group gets its OWN
+self-contained bind-once/update/finalize/destructor sequence, never sharing an id with another group,
+so `aggregate_combine` is never needed at all), `aggregate_finalize` for that one group, `aggregate
+_destructor` to release it (best-effort — a leaked group's worker-side state is a resource leak, never
+a correctness problem, since the result was already returned by finalize). An empty group (a plain
+`SUM` over zero non-null rows) skips `aggregate_update` entirely and relies on the worker's own
+`finalizeEmpty` fallback (confirmed via `AggregateRunner`'s own source) rather than this connector
+needing to special-case per-function "what does empty even mean" semantics.
 
-**Scope for v1** (mirror the scalar-function v1 scoping): positional, non-const, non-vararg,
-non-any-typed args with concrete scalar types; single concrete return type. Explicitly deferred:
-vararg aggregates, `any`-typed/dynamic return, windowed-frame callbacks
-(`aggregate_window_init/_window/_destructor` — a materially different RPC surface, needs Spark's
-`PartitionEvaluator`/window-function SPI, separate follow-up item), the "streaming-partitioned"
-protocol (no Catalyst analogue found — likely **Won't implement**, see below), struct-typed
-returns/args (same bridge gap as scalar), `ConstParam` folding.
+**A real bug found and fixed, only surfacing at scale:** the update batch's group-id column was
+written with `BigIntVector.set()` — the unsafe, non-capacity-growing setter — which threw
+`IndexOutOfBoundsException` once a group's buffered row count exceeded the vector's default initial
+allocation (confirmed live via the sweep: `range(100000)`/`range(1000000)` ungrouped `vgi_sum` calls
+both failed at row 504). Every actual VALUE column was already using the safe, auto-growing
+`VgiScalarValueBridge.writeAt` (which uses `setSafe` throughout) — only the hand-written group-id loop
+missed it. Fixed by switching to `setSafe`; pinned with a new live 100,000-row regression test.
 
-**Unlocks (verify via sweep):**
-- `aggregate/basic.test`, `grouped.test`, `high_cardinality_1k.test`, `high_cardinality_10k.test`,
-  `large_ungrouped.test`, `parallel.test`, `listagg.test` — plain aggregate, v1 shape. **~7 files.**
-- `aggregate/varargs.test`, `any_type.test`, `const_param.test` — need the specific extra
-  capabilities named above; do these as fast-follows once the base wiring is proven. **~3 files.**
-- NOT unlocked: `window.test`, `window_dynamic.test`, `streaming.test` (need the harder RPC
-  surfaces above), `dynamic.test`/`function_registration_dynamic.test` (need
-  `VGI_WORKER_SUPPORTS_DYNAMIC_CODE`), `nest_tensor.test` (struct return), `function_registration*.test`/
-  `same_name_schemas.test` (assert via `duckdb_functions()` regardless).
+**Scope for v1** (mirrors the scalar-function v1 scoping): positional, non-const, non-vararg,
+non-any-typed args with concrete scalar types (zero arguments — a nullary aggregate like `count()` —
+is a real, supported VGI shape, not a special case); single concrete return type. Explicitly deferred,
+not attempted: vararg aggregates, `any`-typed/dynamic return, windowed-frame usage (`OVER (...)` —
+confirmed live to actually fail, not just assumed: a materially different RPC surface needing Spark's
+`PartitionEvaluator`/window-function SPI, a separate follow-up item), the "streaming-partitioned"
+protocol, struct-typed returns/args (same bridge gap as scalar), `ConstParam` folding.
 
-**Verification:** rerun the sweep, check `aggregate/*.test` in the report.
+**Unlocks — verified:**
+- `aggregate/basic.test` — passing curated conformance test (`aggregateBasicMatchesTheRealTestFile`,
+  12 executed / 3 skipped: `ATTACH`/`DETACH` plus the one confirmed-out-of-scope window-aggregate
+  record). Covers ungrouped `vgi_sum`/nullary `vgi_count`/`vgi_avg`, NULL handling, an empty-table
+  case, and a byte-equal-state regression.
+- `aggregate/grouped.test` — passing curated conformance test
+  (`aggregateGroupedMatchesTheRealTestFile`, 5 executed / 2 skipped) — real multi-group `GROUP BY`
+  within one task, up to 100 groups over 1000 rows. `SET threads=1` (DuckDB's own pragma) needed no
+  skip marker at all — Spark's generic `SET` already accepts any key as a harmless no-op string
+  property (the same permissive behavior item 6's settings passthrough relies on).
+- General sweep confirms `aggregate/high_cardinality_1k.test`, `high_cardinality_10k.test`, and
+  `listagg.test` all now fully pass too (0 failures each), without needing dedicated curated tests.
+  `large_ungrouped.test` and `parallel.test` went from real failures (the group-id bug above) to
+  fully passing once that fix landed. Sweep total: 519 → 574 passing records, 10 → 17 files fully
+  passing.
+- 4 new live `VgiCatalogQueryTest` regressions: `callsARealAggregateFunction`,
+  `callsANullaryAggregateFunction`, `callsAGroupedAggregateFunction`,
+  `aggregatesOverAHighCardinalityUngroupedInput` (the group-id bug, pinned directly).
+
+**NOT unlocked** (confirmed, not assumed): `window.test`/`window_dynamic.test`/`streaming.test` (the
+harder RPC surfaces explicitly out of v1 scope above), `dynamic.test`/
+`function_registration_dynamic.test` (need `VGI_WORKER_SUPPORTS_DYNAMIC_CODE`), `nest_tensor.test`
+(struct return), `any_type.test`/`const_param.test`/`varargs.test` (need the specific extra
+capabilities named above — real fast-follow candidates now that the base wiring is proven working),
+`function_registration*.test`/`same_name_schemas.test` (assert via `duckdb_functions()` regardless).
+
+**Verification:** `connector/src/main/java/farm/query/vgispark/function/` (`VgiAggregateFunctions`,
+`VgiUnboundAggregateFunction`, `VgiAggregateFunction`, `VgiAggState`; `VgiScalarValueBridge
+.writeAt` added as the multi-row sibling of the existing single-row `write`), `VgiCatalog
+.loadFunction`/`.listFunctions` (scalar-then-aggregate dispatch). Tests:
+`VgiSqlLogicTestConformanceTest.aggregateBasicMatchesTheRealTestFile` /
+`.aggregateGroupedMatchesTheRealTestFile` (curated, real files), 4 new `VgiCatalogQueryTest` live
+regressions, `VgiSqlLogicTestSweepTest` (general sweep).
 
 ---
 
@@ -828,3 +868,15 @@ process. Worth adding to `VgiSqlLogicTestSweepTest`'s eligibility gate alongside
   worked around by eagerly draining the scan on the driver). Zero sqllogictest sweep payoff (confirmed
   by grepping the corpus — no file uses `CALL` for a VGI table function), verified instead via two new
   live regression tests.
+- **2026-08-25** — Tier 1 item 2 (catalog aggregate functions) done — **all of Tier 1 is now
+  complete.** Shipped exactly the buffer-locally/RPC-once-per-group design already sketched (`update`/
+  `merge` do no RPC at all; `produceResult` lazily binds once per Spark task, mirroring
+  `VgiScalarFunction`'s own lazy-per-task-connection pattern, then does one bind→update→finalize→
+  destructor sequence per group with a locally-invented group id — `aggregate_combine` is never
+  needed). Found and fixed a real bug at scale: the update batch's group-id vector used the unsafe,
+  non-growing `BigIntVector.set()` instead of `setSafe`, throwing `IndexOutOfBoundsException` past a
+  few hundred buffered rows — caught live via the sweep (`range(100000)`/`range(1000000)` ungrouped
+  sums). `aggregate/basic.test` and `grouped.test` now pass as curated conformance tests;
+  `high_cardinality_1k/10k.test` and `listagg.test` pass via the general sweep with no dedicated test
+  needed; `large_ungrouped.test`/`parallel.test` went from real failures to fully passing once the
+  group-id fix landed. Sweep: 519 → 574 passing records, 10 → 17 files fully passing.

@@ -13,6 +13,7 @@ import farm.query.vgirpc.marshal.RecordCodec;
 import farm.query.vgispark.branch.ScanBranchesDecoder;
 import farm.query.vgispark.branch.VgiScanBranch;
 import farm.query.vgispark.client.VgiWorkerClient;
+import farm.query.vgispark.function.VgiAggregateFunctions;
 import farm.query.vgispark.function.VgiScalarFunctions;
 import farm.query.vgispark.procedure.VgiTableProcedures;
 import org.apache.spark.sql.catalyst.analysis.NamespaceAlreadyExistsException;
@@ -316,12 +317,31 @@ public final class VgiCatalog implements TableCatalog, SupportsNamespaces, Funct
 
     @Override
     public Identifier[] listFunctions(String[] namespace) {
-        return VgiScalarFunctions.listFunctions(client, namespace);
+        Identifier[] scalars = VgiScalarFunctions.listFunctions(client, namespace);
+        Identifier[] aggregates = VgiAggregateFunctions.listFunctions(client, namespace);
+        Identifier[] out = new Identifier[scalars.length + aggregates.length];
+        System.arraycopy(scalars, 0, out, 0, scalars.length);
+        System.arraycopy(aggregates, 0, out, scalars.length, aggregates.length);
+        return out;
     }
 
+    /**
+     * A VGI name is unique only within (schema, function_type) — a schema
+     * could in principle declare a scalar and an aggregate under the same
+     * name — but Spark's {@code FunctionCatalog} has one lookup for both
+     * kinds, so scalar is tried first (the more common case) and aggregate
+     * only on a scalar miss, rather than resolving {@code FunctionInfo} once
+     * and dispatching by its own {@code function_type} — a second RPC round
+     * trip on a scalar miss, accepted for v1 since function resolution isn't
+     * a hot path.
+     */
     @Override
     public UnboundFunction loadFunction(Identifier ident) throws NoSuchFunctionException {
-        return VgiScalarFunctions.loadFunction(client, config, ident);
+        try {
+            return VgiScalarFunctions.loadFunction(client, config, ident);
+        } catch (NoSuchFunctionException scalarMiss) {
+            return VgiAggregateFunctions.loadFunction(client, config, ident);
+        }
     }
 
     // ------------------------------------------------------------------

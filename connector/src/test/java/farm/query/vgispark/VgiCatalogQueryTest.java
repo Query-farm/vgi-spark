@@ -484,4 +484,56 @@ class VgiCatalogQueryTest {
         List<Row> rows = spark.sql("CALL " + CATALOG + ".split_sequence(5, 2)").collectAsList();
         assertEquals(5, rows.size());
     }
+
+    @Test
+    @Timeout(60)
+    void callsARealAggregateFunction() {
+        // vgi_sum(i) — a genuine VGI AggregateFunction, real bind/update/
+        // finalize/destructor round trip against a live worker (main schema).
+        Row sum10 = spark.sql("SELECT " + CATALOG + ".main.vgi_sum(i) AS s FROM (VALUES "
+                + "(0L),(1L),(2L),(3L),(4L),(5L),(6L),(7L),(8L),(9L)) t(i)").collectAsList().get(0);
+        assertEquals(45L, sum10.getLong(0));
+
+        Row sum100 = spark.sql("SELECT " + CATALOG + ".main.vgi_sum(i::BIGINT) AS s "
+                + "FROM (SELECT explode(sequence(0, 99)) AS i)").collectAsList().get(0);
+        assertEquals(4950L, sum100.getLong(0));
+    }
+
+    @Test
+    @Timeout(60)
+    void callsANullaryAggregateFunction() {
+        // vgi_count() — zero input columns; exercises the empty-InternalRow /
+        // empty-argFields path through VgiAggregateFunction.
+        Row count = spark.sql("SELECT " + CATALOG + ".main.vgi_count() AS c "
+                + "FROM (SELECT explode(sequence(0, 99)) AS i)").collectAsList().get(0);
+        assertEquals(100L, count.getLong(0));
+    }
+
+    @Test
+    @Timeout(60)
+    void callsAGroupedAggregateFunction() {
+        // Real GROUP BY — multiple groups, multiple produceResult() calls
+        // (and thus multiple worker-side group ids) within one task.
+        List<Row> rows = spark.sql("SELECT k, " + CATALOG + ".main.vgi_sum(i) AS s FROM (VALUES "
+                + "(1, 10L), (1, 20L), (2, 100L), (2, 200L), (2, 300L)) t(k, i) GROUP BY k ORDER BY k")
+                .collectAsList();
+        assertEquals(2, rows.size());
+        assertEquals(1, rows.get(0).getInt(0));
+        assertEquals(30L, rows.get(0).getLong(1));
+        assertEquals(2, rows.get(1).getInt(0));
+        assertEquals(600L, rows.get(1).getLong(1));
+    }
+
+    @Test
+    @Timeout(60)
+    void aggregatesOverAHighCardinalityUngroupedInput() {
+        // Regression: VgiAggregateFunction's update-batch group-id vector used
+        // to be written with a plain (unsafe, non-growing) BigIntVector.set(),
+        // which threw IndexOutOfBoundsException once a group's buffered rows
+        // exceeded the vector's default initial capacity — found live via the
+        // sqllogictest sweep (aggregate/large_ungrouped.test, range(1000000)).
+        Row result = spark.sql("SELECT " + CATALOG + ".main.vgi_sum(i) AS s "
+                + "FROM (SELECT explode(sequence(0, 99999)) AS i)").collectAsList().get(0);
+        assertEquals(4999950000L, result.getLong(0)); // sum(0..99999)
+    }
 }

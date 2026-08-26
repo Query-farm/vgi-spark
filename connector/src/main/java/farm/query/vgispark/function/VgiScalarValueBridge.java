@@ -43,22 +43,33 @@ final class VgiScalarValueBridge {
      * or a null cell if the source column is null.
      */
     static void write(FieldVector vector, DataType type, InternalRow row, int ordinal) {
+        writeAt(vector, type, row, ordinal, 0);
+    }
+
+    /**
+     * Write {@code row}'s column {@code ordinal} into row {@code targetIndex}
+     * of {@code vector} — the multi-row sibling of {@link #write} (which is
+     * always {@code targetIndex == 0}), needed when building a real multi-row
+     * batch (e.g. an aggregate's buffered group rows) rather than a
+     * scalar-function call's single-row argument vector.
+     */
+    static void writeAt(FieldVector vector, DataType type, InternalRow row, int ordinal, int targetIndex) {
         if (row.isNullAt(ordinal)) {
-            vector.setNull(0);
+            vector.setNull(targetIndex);
             return;
         }
         switch (vector) {
-            case BitVector v -> v.setSafe(0, row.getBoolean(ordinal) ? 1 : 0);
-            case TinyIntVector v -> v.setSafe(0, row.getByte(ordinal));
-            case SmallIntVector v -> v.setSafe(0, row.getShort(ordinal));
-            case IntVector v -> v.setSafe(0, row.getInt(ordinal));
-            case BigIntVector v -> v.setSafe(0, row.getLong(ordinal));
-            case Float4Vector v -> v.setSafe(0, row.getFloat(ordinal));
-            case Float8Vector v -> v.setSafe(0, row.getDouble(ordinal));
-            case VarCharVector v -> v.setSafe(0, row.getUTF8String(ordinal).getBytes());
-            case VarBinaryVector v -> v.setSafe(0, row.getBinary(ordinal));
-            case DateDayVector v -> v.setSafe(0, row.getInt(ordinal));
-            case TimeStampMicroVector v -> v.setSafe(0, row.getLong(ordinal));
+            case BitVector v -> v.setSafe(targetIndex, row.getBoolean(ordinal) ? 1 : 0);
+            case TinyIntVector v -> v.setSafe(targetIndex, row.getByte(ordinal));
+            case SmallIntVector v -> v.setSafe(targetIndex, row.getShort(ordinal));
+            case IntVector v -> v.setSafe(targetIndex, row.getInt(ordinal));
+            case BigIntVector v -> v.setSafe(targetIndex, row.getLong(ordinal));
+            case Float4Vector v -> v.setSafe(targetIndex, row.getFloat(ordinal));
+            case Float8Vector v -> v.setSafe(targetIndex, row.getDouble(ordinal));
+            case VarCharVector v -> v.setSafe(targetIndex, row.getUTF8String(ordinal).getBytes());
+            case VarBinaryVector v -> v.setSafe(targetIndex, row.getBinary(ordinal));
+            case DateDayVector v -> v.setSafe(targetIndex, row.getInt(ordinal));
+            case TimeStampMicroVector v -> v.setSafe(targetIndex, row.getLong(ordinal));
             default -> throw new UnsupportedOperationException(
                     "no scalar-function argument writer for Arrow vector type " + vector.getClass().getSimpleName());
         }
