@@ -285,6 +285,19 @@ class VgiSqlLogicTestSweepTest {
     }
 
     private FileOutcome runFile(Path file) throws IOException {
+        // A fresh session PER FILE, not the shared field: SET/RESET (e.g.
+        // settings/multiply_by_setting.test) mutate SESSION-scoped runtime
+        // config, and with FILE_PARALLELISM files now running concurrently
+        // against what used to be one shared session, one file's SET could
+        // race another's — caught for real here (multiply_by_setting.test
+        // intermittently saw "requires settings: ['multiplier']" once file
+        // parallelism landed). SparkSession.newSession() gives isolated SQL
+        // config/temp views while still sharing the underlying SparkContext
+        // and this session's already-attached catalogs (VgiCatalog itself
+        // isn't re-initialized — Spark caches catalog plugin instances at
+        // the session-shared level, so this doesn't reopen worker
+        // connections per file).
+        SparkSession session = spark.newSession();
         List<SqlLogicTestFile.Record> records = SqlLogicTestFile.parse(file);
         int passed = 0;
         int failed = 0;
@@ -315,7 +328,7 @@ class VgiSqlLogicTestSweepTest {
             try {
                 switch (record.kind()) {
                     case QUERY -> {
-                        List<Row> rows = spark.sql(sparkSql).collectAsList();
+                        List<Row> rows = session.sql(sparkSql).collectAsList();
                         List<List<String>> actual = new ArrayList<>(rows.size());
                         for (Row row : rows) {
                             List<String> cells = new ArrayList<>(row.length());
@@ -333,12 +346,12 @@ class VgiSqlLogicTestSweepTest {
                         }
                     }
                     case STATEMENT_OK -> {
-                        spark.sql(sparkSql).collect();
+                        session.sql(sparkSql).collect();
                         passed++;
                     }
                     case STATEMENT_ERROR -> {
                         try {
-                            spark.sql(sparkSql).collect();
+                            session.sql(sparkSql).collect();
                             failed++;
                             addSample(samples, "EXPECTED ERROR, GOT NONE: " + sparkSql);
                         } catch (Exception expected) {
