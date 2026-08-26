@@ -23,6 +23,9 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -80,6 +83,14 @@ class VgiSqlLogicTestSweepTest {
     private static final String SPARK_CATALOG = "vgi_example";
     private static final String STANDARD_ATTACH_LINE =
             "ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');";
+    // How many files run concurrently. Each file's own records still run one
+    // at a time (runFile is a plain sequential loop) — this is file-level
+    // parallelism only. Bounded, not "as many as files": the worker is a
+    // single Python process serving connections on its own daemon threads
+    // (GIL-bound for CPU work), so unlimited concurrency wouldn't keep
+    // scaling, just add contention. Matches FILE_PARALLELISM to the driver
+    // pool size below and to a plausible dev-machine core count.
+    private static final int FILE_PARALLELISM = 8;
 
     private VgiWorkerHarness.Handle worker;
     private SparkSession spark;
@@ -108,12 +119,26 @@ class VgiSqlLogicTestSweepTest {
         worker = VgiWorkerHarness.unix(VGI_PYTHON);
 
         spark = SparkSession.builder()
-                .master("local[2]")
+                // local[8], not local[2]: sweepTheWholeSuite() now submits
+                // FILE_PARALLELISM files' queries concurrently from multiple
+                // driver threads (one SparkSession safely serves concurrent
+                // spark.sql() calls from many threads — a supported,
+                // well-established pattern), and a 2-thread local executor
+                // would just serialize their actual task execution behind
+                // FILE_PARALLELISM concurrent submitters instead of the
+                // sequential loop this used to have — no real gain.
+                .master("local[" + FILE_PARALLELISM + "]")
                 .appName("vgi-spark-sqllogictest-sweep")
                 .config("spark.ui.enabled", "false")
                 .config("spark.sql.catalog." + SPARK_CATALOG, VgiCatalog.class.getName())
                 .config("spark.sql.catalog." + SPARK_CATALOG + ".location", worker.location())
                 .config("spark.sql.catalog." + SPARK_CATALOG + ".catalog-name", "example")
+                // Bumped from the connector's own default (4): the driver-side
+                // VgiWorkerClient pool (catalog/table discovery, every scan's
+                // bind+plan) is shared across every concurrently-running file's
+                // thread — matches FILE_PARALLELISM so concurrent files don't
+                // serialize waiting on pool borrows.
+                .config("spark.sql.catalog." + SPARK_CATALOG + ".connections", String.valueOf(FILE_PARALLELISM))
                 .getOrCreate();
     }
 
@@ -134,40 +159,64 @@ class VgiSqlLogicTestSweepTest {
             allFiles = walk.filter(p -> p.toString().endsWith(".test")).sorted().toList();
         }
 
-        List<FileOutcome> eligible = new ArrayList<>();
+        List<Path> toRun = new ArrayList<>();
         Map<String, Integer> skippedByReason = new LinkedHashMap<>();
-
-        int totalPassed = 0;
-        int totalFailed = 0;
-        List<String> allFailureSamples = new ArrayList<>();
-
         for (Path file : allFiles) {
             String skipReason = eligibilityGate(file);
             if (skipReason != null) {
                 skippedByReason.merge(skipReason, 1, Integer::sum);
-                continue;
+            } else {
+                toRun.add(file);
             }
-            FileOutcome outcome;
-            try {
-                outcome = runFile(file);
-            } catch (Exception e) {
-                // One file's unexpected failure (not a per-record SQL error,
-                // which runFile already catches — something structural, e.g.
-                // a session-level fault) must not lose every other file's
-                // already-accumulated results. Catches Exception, not just
-                // RuntimeException: Spark's own AnalysisException (thrown for
-                // e.g. an unresolved routine) is a CHECKED exception —
-                // confirmed the hard way once already in this codebase (see
-                // VgiCatalog's loadTable/loadNamespaceMetadata) and re-learned
-                // here when it escaped a narrower catch and aborted the whole
-                // sweep after only one file.
-                outcome = new FileOutcome(file, 0, 1, 1,
-                        List.of("FILE-LEVEL ERROR: " + firstLine(e)), null);
+        }
+
+        // Files run concurrently (up to FILE_PARALLELISM at once); each
+        // file's OWN records still run sequentially inside runFile — this is
+        // file-level, not record-level, parallelism. Submitting first and
+        // collecting after (rather than accumulating totals inside the
+        // per-file task) keeps every shared mutable variable
+        // (eligible/totalPassed/totalFailed/allFailureSamples below)
+        // touched from this one thread only, so none of it needs
+        // synchronization.
+        List<FileOutcome> eligible = new ArrayList<>();
+        int totalPassed = 0;
+        int totalFailed = 0;
+        List<String> allFailureSamples = new ArrayList<>();
+
+        ExecutorService pool = Executors.newFixedThreadPool(FILE_PARALLELISM,
+                r -> { Thread t = new Thread(r, "vgi-sweep-file"); t.setDaemon(true); return t; });
+        try {
+            List<Future<FileOutcome>> futures = new ArrayList<>(toRun.size());
+            for (Path file : toRun) {
+                futures.add(pool.submit(() -> {
+                    try {
+                        return runFile(file);
+                    } catch (Exception e) {
+                        // One file's unexpected failure (not a per-record SQL
+                        // error, which runFile already catches — something
+                        // structural, e.g. a session-level fault) must not lose
+                        // every other file's already-accumulated results.
+                        // Catches Exception, not just RuntimeException: Spark's
+                        // own AnalysisException (thrown for e.g. an unresolved
+                        // routine) is a CHECKED exception — confirmed the hard
+                        // way once already in this codebase (see VgiCatalog's
+                        // loadTable/loadNamespaceMetadata) and re-learned here
+                        // when it escaped a narrower catch and aborted the
+                        // whole sweep after only one file.
+                        return new FileOutcome(file, 0, 1, 1,
+                                List.of("FILE-LEVEL ERROR: " + firstLine(e)), null);
+                    }
+                }));
             }
-            eligible.add(outcome);
-            totalPassed += outcome.passed();
-            totalFailed += outcome.failed();
-            allFailureSamples.addAll(outcome.failureSamples());
+            for (Future<FileOutcome> future : futures) {
+                FileOutcome outcome = future.get();
+                eligible.add(outcome);
+                totalPassed += outcome.passed();
+                totalFailed += outcome.failed();
+                allFailureSamples.addAll(outcome.failureSamples());
+            }
+        } finally {
+            pool.shutdownNow();
         }
 
         int filesWithFailures = (int) eligible.stream().filter(o -> o.failed() > 0).count();

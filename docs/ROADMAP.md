@@ -601,3 +601,12 @@ process. Worth adding to `VgiSqlLogicTestSweepTest`'s eligibility gate alongside
   warm worker over a Unix socket cut the sweep's own isolated wall-clock from ~16 minutes to ~4m30s
   with identical results (430 passed, 9 files fully passing). Test-only change, no production code
   or behavior affected.
+- **2026-08-25** — Further sweep speedup: `VgiSqlLogicTestSweepTest` now runs up to 8 `.test` files
+  concurrently (a fixed thread pool, each file's own records still sequential — file-level, not
+  record-level, parallelism), with `local[8]` and the catalog's `connections` option bumped to match
+  so neither Spark's local executor nor the driver-side `VgiWorkerClient` pool serializes concurrent
+  files behind each other. Cut the sweep's isolated wall-clock further, ~4m30s → ~2m37s (full suite:
+  ~2m54s). Pass count moved 430 → 443 with the same total (2944) records attempted and the same 9
+  files fully passing — consistent with less flaky-INTERNAL_ERROR exposure from a shorter run
+  (14 occurrences → 2), not a behavior change; no concurrency-related errors (pool contention,
+  deadlocks) appeared. Test-only change.
