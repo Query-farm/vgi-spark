@@ -413,7 +413,7 @@ test-harness fix, not a production one, but a real correctness bug nonetheless.
 ---
 
 ### 7. Scalar function scope expansion
-**Status:** ⬜ Not started (several independent sub-items, can be done incrementally)
+**Status:** 🟡 In progress — 7b landed (partial payoff, see below); 7a/7c/7d/7e not started
 
 Each of these lifts one specific restriction from `VgiUnboundScalarFunction`'s v1 validation. Pick
 off independently as needed — don't do all at once.
@@ -424,10 +424,31 @@ off independently as needed — don't do all at once.
   handles nesting generically; scalar functions have no such generic wrapper since each argument/
   return is one cell, not a batch. Unlocks `scalar/geo_centroid.test`, `geo_distance.test`,
   `binary_packet.test` (also const, see 7c) — **~3 files** (2 also need varargs, 7d).
-- **7b. Decimal / unsigned-int scalar types.** Extends `VgiTypeMapping`/`VgiScalarValueBridge` to
-  cover `DecimalType` and unsigned Arrow ints (currently excluded from both the table-read
-  `VgiTypeMapping.toSparkType` unsigned-64 caveat and the scalar bridge entirely for decimal).
-  Unlocks `scalar/numeric_promotion.test` — **1 file**.
+- **7b. Decimal scalar types + any-typed args/returns.** ✅ Done. `VgiScalarValueBridge` now
+  reads/writes `DecimalVector` (`Decimal.apply(BigDecimal, precision, scale)` round-trip).
+  `VgiUnboundScalarFunction` no longer resolves a scalar function's return type — or an
+  individual argument's type — at static discovery time; both are resolved from the REAL
+  `bind(StructType)` call, symmetrically: an `any`-typed return is read from `BindResponse
+  .output_schema()` (the worker's own `on_bind`-computed concrete type, e.g. `DECIMAL(10,2)` in
+  → `DECIMAL(11,2)` out), and an `any`-typed argument is read directly from `bind`'s `StructType
+  inputSchema` parameter — which Spark already populates with the call site's real, concrete
+  argument type — and round-tripped back to the worker as a per-call-site Arrow field via a new
+  reverse mapper, `VgiTypeMapping.toArrowField(name, DataType, nullable)` (the first Spark→Arrow
+  direction this connector needed; everywhere else only needed Arrow→Spark). Confirmed live
+  necessary, not hypothetical: `numeric_promotion.test`'s `double(value)` and `add_values(a, b)`
+  declare BOTH their arguments and their returns `any`-typed at the wire level.
+  **Unsigned-int support was investigated and deliberately not pursued**: Spark's parser cannot
+  even parse the `::UTINYINT`/`::UINTEGER` cast syntax those records use, and Spark's type system
+  has no unsigned integer type to represent the promoted `typeof()` results the same records
+  assert (`"USMALLINT"`, `"UBIGINT"`) — a hard ceiling, not a scoping choice. Net payoff on
+  `scalar/numeric_promotion.test` is therefore partial (4/12 records passing, up from 0/12): the
+  DECIMAL-only records now pass; the UNSIGNED-int records remain permanently out of reach; one
+  further record (`typeof(double(1.5::REAL))`, expecting the string `"DOUBLE"`) surfaced a
+  **pre-existing, corpus-wide, unrelated gap** — the conformance/sweep runners do no DuckDB→Spark
+  type-name normalization for `typeof()` output (DuckDB says `"DOUBLE"`, Spark's `typeof()` says
+  `"double"`), so every `typeof()`-based record anywhere in the corpus already mismatches on
+  casing/naming regardless of this item; worth its own follow-up (a small string-normalization
+  table in the runner) rather than folding into 7b.
 - **7c. Const (bind-time-constant) scalar arguments.** A `vgi_const` argument's *value* needs to be
   read from the call site's literal at `bind()` time (Spark's `UnboundFunction.bind(StructType)`
   only sees types, not values — same limitation `vgi-trino`'s `BindCache` worked around, see its
@@ -880,3 +901,14 @@ process. Worth adding to `VgiSqlLogicTestSweepTest`'s eligibility gate alongside
   `high_cardinality_1k/10k.test` and `listagg.test` pass via the general sweep with no dedicated test
   needed; `large_ungrouped.test`/`parallel.test` went from real failures to fully passing once the
   group-id fix landed. Sweep: 519 → 574 passing records, 10 → 17 files fully passing.
+- **2026-08-26** — Tier 2 item 7b (decimal scalar types + any-typed scalar args/returns) done.
+  `VgiScalarValueBridge` gained `DecimalVector` read/write; `VgiUnboundScalarFunction` now resolves
+  both an `any`-typed return AND an `any`-typed argument from the real `bind(StructType)` call
+  instead of refusing either statically, using a new `VgiTypeMapping.toArrowField` reverse
+  (Spark→Arrow) mapper. Unsigned-int support investigated and NOT pursued (Spark can't parse
+  `::UTINYINT`/`::UINTEGER` and has no unsigned integer type to represent the promoted `typeof()`
+  results those records assert — a hard ceiling). Also surfaced, in passing, a pre-existing
+  corpus-wide gap unrelated to this item: the conformance/sweep runners do no DuckDB→Spark
+  `typeof()` string normalization (`"DOUBLE"` vs `"double"`) — noted under item 7b, not fixed here.
+  Full `./gradlew :connector:test` green (50/50). Sweep: 574 → 624 passing records, 17 → 19 files
+  fully passing.

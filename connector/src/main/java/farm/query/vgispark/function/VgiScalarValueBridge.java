@@ -5,6 +5,7 @@ package farm.query.vgispark.function;
 import org.apache.arrow.vector.BigIntVector;
 import org.apache.arrow.vector.BitVector;
 import org.apache.arrow.vector.DateDayVector;
+import org.apache.arrow.vector.DecimalVector;
 import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.Float4Vector;
 import org.apache.arrow.vector.Float8Vector;
@@ -17,6 +18,8 @@ import org.apache.arrow.vector.VarCharVector;
 import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.types.DataType;
 import org.apache.spark.sql.types.DataTypes;
+import org.apache.spark.sql.types.Decimal;
+import org.apache.spark.sql.types.DecimalType;
 import org.apache.spark.unsafe.types.UTF8String;
 
 /**
@@ -70,6 +73,10 @@ final class VgiScalarValueBridge {
             case VarBinaryVector v -> v.setSafe(targetIndex, row.getBinary(ordinal));
             case DateDayVector v -> v.setSafe(targetIndex, row.getInt(ordinal));
             case TimeStampMicroVector v -> v.setSafe(targetIndex, row.getLong(ordinal));
+            case DecimalVector v -> {
+                DecimalType dt = (DecimalType) type;
+                v.setSafe(targetIndex, row.getDecimal(ordinal, dt.precision(), dt.scale()).toJavaBigDecimal());
+            }
             default -> throw new UnsupportedOperationException(
                     "no scalar-function argument writer for Arrow vector type " + vector.getClass().getSimpleName());
         }
@@ -96,6 +103,10 @@ final class VgiScalarValueBridge {
             case VarBinaryVector v -> v.get(row);
             case DateDayVector v -> v.get(row);
             case TimeStampMicroVector v -> v.get(row);
+            case DecimalVector v -> {
+                DecimalType dt = (DecimalType) type;
+                yield Decimal.apply(v.getObject(row), dt.precision(), dt.scale());
+            }
             default -> throw new UnsupportedOperationException(
                     "no scalar-function result reader for Arrow vector type " + vector.getClass().getSimpleName());
         };
@@ -108,6 +119,7 @@ final class VgiScalarValueBridge {
                 || type.equals(DataTypes.LongType) || type.equals(DataTypes.FloatType)
                 || type.equals(DataTypes.DoubleType) || type.equals(DataTypes.StringType)
                 || type.equals(DataTypes.BinaryType) || type.equals(DataTypes.DateType)
-                || type.equals(DataTypes.TimestampType) || type.equals(DataTypes.TimestampNTZType);
+                || type.equals(DataTypes.TimestampType) || type.equals(DataTypes.TimestampNTZType)
+                || type instanceof DecimalType;
     }
 }

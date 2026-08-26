@@ -2,10 +2,15 @@
 
 package farm.query.vgispark.types;
 
+import org.apache.arrow.vector.types.DateUnit;
+import org.apache.arrow.vector.types.FloatingPointPrecision;
+import org.apache.arrow.vector.types.TimeUnit;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.spark.sql.types.DataType;
 import org.apache.spark.sql.types.DataTypes;
+import org.apache.spark.sql.types.DecimalType;
 import org.apache.spark.sql.types.StructField;
 import org.apache.spark.sql.types.StructType;
 
@@ -140,6 +145,68 @@ public final class VgiTypeMapping {
                     VgiColumnNames.displayName(field), toSparkType(field), field.isNullable());
         }
         return DataTypes.createStructType(out);
+    }
+
+    /**
+     * Map one Spark {@link DataType} to an Arrow {@link Field} — the reverse
+     * of {@link #toSparkType(Field)}, needed only for the one case where a
+     * VGI scalar-function ARGUMENT is declared {@code vgi_type=="any"} (a
+     * dynamic/generic type resolved per call site): {@code
+     * UnboundFunction#bind(StructType)} already receives the call site's
+     * real, concrete Spark argument type, so rather than refusing statically
+     * this builds the Arrow field for that one call site's {@code
+     * BindRequest.input_schema} on demand.
+     *
+     * <p>Deliberately narrower than {@link #toSparkType}'s full range: only
+     * the primitive types {@code VgiScalarValueBridge} can actually read/
+     * write one-value-at-a-time (bool/byte/short/int/long/float/double/
+     * string/binary/date/timestamp/decimal) — the same set {@code
+     * VgiScalarValueBridge.isSupported} accepts. Struct/list/map arguments
+     * are out of scope for scalar functions in v1 regardless of whether they
+     * are statically or dynamically typed, so this method doesn't need to
+     * handle them.
+     *
+     * @throws UnsupportedOperationException if {@code type} isn't one of the
+     *         primitive types listed above
+     */
+    public static Field toArrowField(String name, DataType type, boolean nullable) {
+        ArrowType arrowType;
+        if (type.equals(DataTypes.BooleanType)) {
+            arrowType = new ArrowType.Bool();
+        } else if (type.equals(DataTypes.ByteType)) {
+            arrowType = new ArrowType.Int(8, true);
+        } else if (type.equals(DataTypes.ShortType)) {
+            arrowType = new ArrowType.Int(16, true);
+        } else if (type.equals(DataTypes.IntegerType)) {
+            arrowType = new ArrowType.Int(32, true);
+        } else if (type.equals(DataTypes.LongType)) {
+            arrowType = new ArrowType.Int(64, true);
+        } else if (type.equals(DataTypes.FloatType)) {
+            arrowType = new ArrowType.FloatingPoint(FloatingPointPrecision.SINGLE);
+        } else if (type.equals(DataTypes.DoubleType)) {
+            arrowType = new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE);
+        } else if (type.equals(DataTypes.StringType)) {
+            arrowType = new ArrowType.Utf8();
+        } else if (type.equals(DataTypes.BinaryType)) {
+            arrowType = new ArrowType.Binary();
+        } else if (type.equals(DataTypes.DateType)) {
+            arrowType = new ArrowType.Date(DateUnit.DAY);
+        } else if (type.equals(DataTypes.TimestampType)) {
+            // Spark's TimestampType is session-local-timezone semantics; any
+            // non-null zone name round-trips through toSparkType's "has a
+            // zone -> TimestampType" check the same way, so the zone value
+            // itself carries no further meaning here.
+            arrowType = new ArrowType.Timestamp(TimeUnit.MICROSECOND, "UTC");
+        } else if (type.equals(DataTypes.TimestampNTZType)) {
+            arrowType = new ArrowType.Timestamp(TimeUnit.MICROSECOND, null);
+        } else if (type instanceof DecimalType dt) {
+            arrowType = new ArrowType.Decimal(dt.precision(), dt.scale(), 128);
+        } else {
+            throw new UnsupportedOperationException(
+                    "argument '" + name + "': no Arrow mapping for Spark type " + type.typeName()
+                            + " (only the primitive types a scalar-function call can bridge one value at a time)");
+        }
+        return new Field(name, new FieldType(nullable, arrowType, null), null);
     }
 
     private static UnsupportedOperationException unsupported(ArrowType type, String columnName) {

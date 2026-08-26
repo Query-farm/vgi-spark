@@ -536,4 +536,26 @@ class VgiCatalogQueryTest {
                 + "FROM (SELECT explode(sequence(0, 99999)) AS i)").collectAsList().get(0);
         assertEquals(4999950000L, result.getLong(0)); // sum(0..99999)
     }
+
+    @Test
+    @Timeout(60)
+    void scalarFunctionReturnsAnOnBindPromotedDecimal() {
+        // double(value) — roadmap item 7b: its return type is on_bind-computed
+        // from the REAL argument type (DECIMAL(p,s) in -> DECIMAL(p+1,s) out),
+        // not statically known at discovery time. Exercises
+        // VgiUnboundScalarFunction.resolveReturnType (called from bind() with
+        // the real post-bind output schema) end to end against a live worker.
+        Row result = spark.sql("SELECT " + CATALOG + ".double(1.25::DECIMAL(10,2)) AS r").collectAsList().get(0);
+        assertEquals(new java.math.BigDecimal("2.50"), result.getDecimal(0));
+    }
+
+    @Test
+    @Timeout(60)
+    void scalarFunctionAddsTwoDecimalArguments() {
+        // add_values(a, b) — plain DECIMAL-typed arguments (VgiScalarValueBridge's
+        // new Decimal write/read path), not just a promoted return.
+        Row result = spark.sql("SELECT " + CATALOG + ".add_values(1.50::DECIMAL(5,2), 2.250::DECIMAL(7,3)) AS r")
+                .collectAsList().get(0);
+        assertEquals(0, new java.math.BigDecimal("3.750").compareTo(result.getDecimal(0)));
+    }
 }
