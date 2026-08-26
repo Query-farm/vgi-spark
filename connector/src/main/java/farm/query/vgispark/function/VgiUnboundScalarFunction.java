@@ -76,11 +76,12 @@ final class VgiUnboundScalarFunction implements UnboundFunction {
     private final DataType[] inputTypes;
     private final boolean[] anyArgs;
     private final boolean[] constArgs;
+    private final boolean hasVarargs; // true iff the LAST declared argument is vgi_varargs
     private final boolean deterministic;
 
     private VgiUnboundScalarFunction(VgiWorkerClient client, VgiCatalogConfig config, String schemaName,
             FunctionInfo info, Schema argsSchema, DataType[] inputTypes, boolean[] anyArgs,
-            boolean[] constArgs, boolean deterministic) {
+            boolean[] constArgs, boolean hasVarargs, boolean deterministic) {
         this.client = client;
         this.config = config;
         this.schemaName = schemaName;
@@ -89,6 +90,7 @@ final class VgiUnboundScalarFunction implements UnboundFunction {
         this.inputTypes = inputTypes;
         this.anyArgs = anyArgs;
         this.constArgs = constArgs;
+        this.hasVarargs = hasVarargs;
         this.deterministic = deterministic;
     }
 
@@ -105,35 +107,81 @@ final class VgiUnboundScalarFunction implements UnboundFunction {
     @Override
     public BoundFunction bind(StructType inputSchema) {
         String context = schemaName + "." + info.name();
-        if (inputSchema.length() != inputTypes.length) {
+        int declaredCount = inputTypes.length;
+        int callArity = inputSchema.length();
+        if (hasVarargs) {
+            // The trailing vararg position may repeat zero or more times —
+            // callArity must be at least the fixed (non-vararg) prefix count.
+            if (callArity < declaredCount - 1) {
+                throw new UnsupportedOperationException(context + " takes at least " + (declaredCount - 1)
+                        + " argument(s), got " + callArity);
+            }
+        } else if (callArity != declaredCount) {
             throw new UnsupportedOperationException(
-                    context + " takes " + inputTypes.length + " argument(s), got " + inputSchema.length());
+                    context + " takes " + declaredCount + " argument(s), got " + callArity);
         }
 
-        // Resolve any "any"-typed arguments (const or not) from THIS call
-        // site's real, concrete Spark argument types — see this class's own
-        // javadoc. Non-"any" arguments keep their statically-discovered
-        // field/type unchanged. Always builds a full-length resolved field
-        // list (even when nothing actually changed) since both the eager
-        // and const-deferred paths below need it uniformly.
-        DataType[] resolvedInputTypes = inputTypes.clone();
-        List<Field> resolvedFields = new java.util.ArrayList<>(argsSchema.getFields());
-        for (int i = 0; i < anyArgs.length; i++) {
-            if (!anyArgs[i]) continue;
+        // Resolve every argument's REAL, call-site type where it isn't
+        // statically known: an "any"-typed argument (see this class's own
+        // javadoc), and — separately — every position the vararg group
+        // expands to (see below). Non-"any", non-vararg-expanded arguments
+        // keep their statically-discovered field/type unchanged. Always
+        // builds a full, CALL-SITE-length (not declared-length) resolved
+        // list, since both the eager and const-deferred paths below need it
+        // uniformly, and a vararg call site's effective arity can differ
+        // from the declared one.
+        DataType[] resolvedInputTypes = new DataType[callArity];
+        List<Field> resolvedFields = new java.util.ArrayList<>(callArity);
+        boolean[] resolvedConstArgs = new boolean[callArity];
+        List<Field> staticFields = argsSchema.getFields();
+        int fixedCount = hasVarargs ? declaredCount - 1 : declaredCount;
+        for (int i = 0; i < fixedCount; i++) {
+            Field staticField = staticFields.get(i);
+            resolvedConstArgs[i] = constArgs[i];
+            if (!anyArgs[i]) {
+                resolvedInputTypes[i] = inputTypes[i];
+                resolvedFields.add(staticField);
+                continue;
+            }
             org.apache.spark.sql.types.StructField callSiteField = inputSchema.fields()[i];
-            DataType realType = callSiteField.dataType();
+            boolean wasNullType = callSiteField.dataType() instanceof org.apache.spark.sql.types.NullType;
+            DataType realType = resolveCallSiteType(callSiteField.dataType());
             if (!VgiScalarValueBridge.isSupported(realType)) {
-                throw new UnsupportedOperationException(context + ": argument '" + resolvedFields.get(i).getName()
+                throw new UnsupportedOperationException(context + ": argument '" + staticField.getName()
                         + "' is any-typed and this call site's real type " + realType
                         + " is not bridged (struct/list/map arguments are a later phase)");
             }
             resolvedInputTypes[i] = realType;
-            resolvedFields.set(i, farm.query.vgispark.types.VgiTypeMapping.toArrowField(
-                    resolvedFields.get(i).getName(), realType, callSiteField.nullable()));
+            resolvedFields.add(farm.query.vgispark.types.VgiTypeMapping.toArrowField(
+                    staticField.getName(), realType, wasNullType || callSiteField.nullable()));
+        }
+        if (hasVarargs) {
+            // Every expanded vararg position is resolved from THIS call
+            // site's real type independently — a repeating vararg group's
+            // whole point is per-call flexibility (potentially even a
+            // different concrete type at each position, e.g. sum_values'
+            // on_bind computing its return from just the FIRST one) — never
+            // refused for being "any"-typed, unlike a plain fixed argument.
+            Field varargSpec = staticFields.get(declaredCount - 1);
+            for (int i = fixedCount; i < callArity; i++) {
+                org.apache.spark.sql.types.StructField callSiteField = inputSchema.fields()[i];
+                boolean wasNullType = callSiteField.dataType() instanceof org.apache.spark.sql.types.NullType;
+                DataType realType = resolveCallSiteType(callSiteField.dataType());
+                if (!VgiScalarValueBridge.isSupported(realType)) {
+                    throw new UnsupportedOperationException(context + ": vararg argument '" + varargSpec.getName()
+                            + "' at position " + i + " has this call site's real type " + realType
+                            + ", which is not bridged (struct/list/map arguments are a later phase)");
+                }
+                resolvedInputTypes[i] = realType;
+                resolvedFields.add(farm.query.vgispark.types.VgiTypeMapping.toArrowField(
+                        varargSpec.getName() + "_" + (i - fixedCount), realType,
+                        wasNullType || callSiteField.nullable()));
+                resolvedConstArgs[i] = false; // vgi_const + vgi_varargs is refused together at discovery
+            }
         }
 
         boolean hasConstArgs = false;
-        for (boolean b : constArgs) if (b) { hasConstArgs = true; break; }
+        for (boolean b : resolvedConstArgs) if (b) { hasConstArgs = true; break; }
 
         // Row (non-const) vs. const argument split, in signature order —
         // identical to [0..n) / [] when there are no const arguments at all.
@@ -141,7 +189,7 @@ final class VgiUnboundScalarFunction implements UnboundFunction {
         List<Integer> constIdx = new java.util.ArrayList<>();
         List<Field> rowFields = new java.util.ArrayList<>();
         for (int i = 0; i < resolvedInputTypes.length; i++) {
-            if (constArgs[i]) constIdx.add(i);
+            if (resolvedConstArgs[i]) constIdx.add(i);
             else { rowIdx.add(i); rowFields.add(resolvedFields.get(i)); }
         }
         int[] rowArgIndices = rowIdx.stream().mapToInt(Integer::intValue).toArray();
@@ -188,6 +236,29 @@ final class VgiUnboundScalarFunction implements UnboundFunction {
         DataType returnType = resolveStaticReturnType(context);
         return VgiScalarFunction.lazyConst(config, schemaName, info.name(), resolvedInputTypes, resolvedFieldsArray,
                 rowArgIndices, constArgIndices, rowInputSchemaBytes, returnType, deterministic);
+    }
+
+    /**
+     * A bare {@code NULL} literal with no cast (e.g. {@code sum_values(1,
+     * NULL, 3)}) analyzes to Spark's {@code NullType} — a real type with no
+     * bridgeable Arrow counterpart, but also not a genuine "this argument's
+     * type is unknowable" case: the cell will be null on the wire regardless
+     * of which declared type it travels as (VGI already round-trips a null
+     * cell correctly for any Arrow type), so rather than refusing the whole
+     * call site, this substitutes a safe, universally-bridgeable placeholder
+     * ({@link DataTypes#LongType}) wherever the call site's real type is
+     * {@code NullType}. DuckDB's own binder instead unifies a NULL literal's
+     * type from its sibling arguments' types before ever reaching {@code
+     * bind()}; Spark's analyzer does no such contextual coercion for a
+     * custom {@code ScalarFunction}'s arguments, so this is the closest
+     * faithful equivalent available — confirmed live against {@code
+     * sum_values.test}'s NULL-handling section, where the row-level RESULT
+     * is null either way, independent of which placeholder type was used to
+     * declare the (always-null) wire cell.
+     */
+    private static DataType resolveCallSiteType(DataType raw) {
+        return raw instanceof org.apache.spark.sql.types.NullType ? org.apache.spark.sql.types.DataTypes.LongType
+                : raw;
     }
 
     /**
@@ -379,10 +450,13 @@ final class VgiUnboundScalarFunction implements UnboundFunction {
         DataType[] inputTypes = new DataType[argFields.size()];
         boolean[] anyArgs = new boolean[argFields.size()];
         boolean[] constArgs = new boolean[argFields.size()];
+        boolean hasVarargs = false;
         for (int i = 0; i < argFields.size(); i++) {
             Field field = argFields.get(i);
             java.util.Map<String, String> md = field.getMetadata();
             String vgiType = md == null ? null : md.get("vgi_type");
+            boolean isVarargs = md != null && "true".equals(md.get("vgi_varargs"));
+            boolean isConst = md != null && "true".equals(md.get("vgi_const"));
             if ("table".equals(vgiType)) {
                 throw new UnsupportedOperationException(context + ": argument '" + field.getName()
                         + "' is TABLE-typed, not a scalar argument");
@@ -391,15 +465,28 @@ final class VgiUnboundScalarFunction implements UnboundFunction {
                 throw new UnsupportedOperationException(context + ": argument '" + field.getName()
                         + "' is a named argument — only positional arguments are supported yet");
             }
-            if (md != null && "true".equals(md.get("vgi_const"))) {
+            if (isVarargs && i != argFields.size() - 1) {
+                throw new UnsupportedOperationException(context + ": argument '" + field.getName()
+                        + "' is vgi_varargs but isn't the LAST argument — a repeating trailing argument "
+                        + "is the only vararg shape supported");
+            }
+            if (isVarargs && isConst) {
+                throw new UnsupportedOperationException(context + ": argument '" + field.getName()
+                        + "' is both vgi_const and vgi_varargs, a combination with no clear wire meaning");
+            }
+            if (isConst) {
                 // Value (not just type) resolved later, per call, from the
                 // real InternalRow — see bind()/VgiScalarFunction's own
                 // lazy-bind-cache javadoc.
                 constArgs[i] = true;
             }
-            if (md != null && "true".equals(md.get("vgi_varargs"))) {
-                throw new UnsupportedOperationException(context + ": argument '" + field.getName()
-                        + "' is variadic (vgi_varargs) — not supported yet");
+            if (isVarargs) {
+                // Every expanded call-site position resolved later, from
+                // bind(StructType) — see this class's own javadoc and bind's
+                // own vararg-expansion comment. No static type to check here
+                // at all (unlike a plain "any" argument, this one repeats).
+                hasVarargs = true;
+                continue;
             }
             if ("any".equals(vgiType)) {
                 // Real type resolved later, from bind(StructType)'s real
@@ -441,6 +528,6 @@ final class VgiUnboundScalarFunction implements UnboundFunction {
 
         return new VgiUnboundScalarFunction(
                 client, config, schemaName, info, argsSchema == null ? new Schema(List.of()) : argsSchema,
-                inputTypes, anyArgs, constArgs, deterministic);
+                inputTypes, anyArgs, constArgs, hasVarargs, deterministic);
     }
 }

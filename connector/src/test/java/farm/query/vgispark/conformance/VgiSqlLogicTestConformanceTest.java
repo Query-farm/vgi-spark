@@ -543,4 +543,44 @@ class VgiSqlLogicTestConformanceTest {
                 "expected skip count changed — see CONDITIONAL_MESSAGE_NON_PORTABLE_MARKERS");
         assertEquals(19, result.executed(), "expected executed-record count changed");
     }
+
+    /**
+     * {@code scalar/sum_values.test} (roadmap tier 2 item 7d): {@code
+     * sum_values(values...)} is a single {@code vgi_varargs} argument,
+     * called at 1, 2, 3, 4, 5, 6, 7, 8, and 10 arguments across this file —
+     * exercises {@code VgiUnboundScalarFunction.bind}'s vararg-expansion path
+     * at many distinct effective arities within one query file, its
+     * per-position any-typed resolution, NULL propagation through a
+     * multi-column vararg group, real multi-partition execution over a
+     * 5000-row table, and the zero-arg regression ({@code sum_values()}
+     * must surface the worker's own clean validation error, not crash this
+     * connector). Non-portable: {@code ATTACH}/{@code DETACH}, {@code
+     * typeof(...)} records (same pre-existing casing gap as 7b/7c), and
+     * {@code unnest(generate_series(...))} (DuckDB-only, unrelated) — and,
+     * consequently, every record referencing the three tables that file's
+     * own (skipped) {@code unnest(generate_series(...))}-based {@code CREATE
+     * TABLE}s would have populated ({@code large_triplets}/{@code
+     * large_quads}/{@code large_double_triplets}), since those tables are
+     * never actually created here.
+     */
+    private static final List<String> SUM_VALUES_NON_PORTABLE_MARKERS =
+            List.of("ATTACH ", "DETACH", "unnest(generate_series", "typeof(",
+                    "large_triplets", "large_quads", "large_double_triplets");
+
+    @Test
+    @Timeout(300)
+    void sumValuesMatchesTheRealTestFile() throws Exception {
+        Path testFile = VGI_TEST_ROOT.toPath().resolve("scalar/sum_values.test");
+        Assumptions.assumeTrue(testFile.toFile().isFile(), testFile + " not present");
+
+        SqlLogicTestRunner.Result result = SqlLogicTestRunner.run(spark, testFile,
+                "example.", SPARK_CATALOG, SUM_VALUES_NON_PORTABLE_MARKERS);
+
+        if (!result.failures().isEmpty()) {
+            fail(result.executed() + " executed, " + result.skipped() + " skipped, "
+                    + result.failures().size() + " FAILED:\n" + String.join("\n---\n", result.failures()));
+        }
+        assertEquals(28, result.skipped(), "expected skip count changed — see SUM_VALUES_NON_PORTABLE_MARKERS");
+        assertEquals(53, result.executed(), "expected executed-record count changed");
+    }
 }

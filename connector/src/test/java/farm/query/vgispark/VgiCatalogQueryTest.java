@@ -597,4 +597,32 @@ class VgiCatalogQueryTest {
         List<String> actual = rows.stream().map(r -> r.getString(0)).toList();
         assertEquals(List.of("x", "x", "xx", "xx", "xxx"), actual);
     }
+
+    @Test
+    @Timeout(60)
+    void scalarFunctionAcceptsAVaryingNumberOfVarargsArguments() {
+        // sum_values(values...) — roadmap item 7d: a single vgi_varargs
+        // argument, expanded per call site to however many columns were
+        // actually written (2, then 5, then 1) — VgiUnboundScalarFunction
+        // .bind's vararg-expansion path, each expanded position independently
+        // resolved from the real call-site type (sum_values is also
+        // any-typed with an on_bind-promoted return, exercising both at once).
+        assertEquals(30L, spark.sql("SELECT " + CATALOG + ".sum_values(10, 20) AS r")
+                .collectAsList().get(0).getLong(0));
+        assertEquals(150L, spark.sql("SELECT " + CATALOG + ".sum_values(10, 20, 30, 40, 50) AS r")
+                .collectAsList().get(0).getLong(0));
+        assertEquals(42L, spark.sql("SELECT " + CATALOG + ".sum_values(42) AS r")
+                .collectAsList().get(0).getLong(0));
+    }
+
+    @Test
+    @Timeout(60)
+    void scalarFunctionVarargsPropagatesNullAndSumsATableColumns() {
+        List<Row> rows = spark.sql("SELECT " + CATALOG + ".sum_values(a, b, c) AS r "
+                        + "FROM (VALUES (1, 2, 3), (NULL, 5, 6), (7, 8, 9)) t(a, b, c) ORDER BY r NULLS LAST")
+                .collectAsList();
+        assertEquals(6L, rows.get(0).getLong(0));
+        assertEquals(24L, rows.get(1).getLong(0));
+        assertEquals(true, rows.get(2).isNullAt(0));
+    }
 }

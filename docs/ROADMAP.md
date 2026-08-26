@@ -413,7 +413,7 @@ test-harness fix, not a production one, but a real correctness bug nonetheless.
 ---
 
 ### 7. Scalar function scope expansion
-**Status:** 🟡 In progress — 7b and 7c landed (see below); 7a/7d/7e not started
+**Status:** 🟡 In progress — 7b, 7c, 7d landed (see below); 7a/7e not started
 
 Each of these lifts one specific restriction from `VgiUnboundScalarFunction`'s v1 validation. Pick
 off independently as needed — don't do all at once.
@@ -478,11 +478,26 @@ off independently as needed — don't do all at once.
   record — the same pre-existing DuckDB→Spark type-name-casing gap noted under 7b, not fixed here).
   Contributes to `binary_packet.test` (7a), `overload/scalar_overload.test` (const-count/const-type
   dispatch, tier 2 item 9).
-- **7d. Vararg scalar functions.** `UnboundFunction.bind(StructType)` receives the CALL SITE's
-  actual arity — nothing stops recognizing "this is more args than the declared fixed signature,
-  treat the trailing ones as a repeating vararg group" the way `vgi-trino`'s `effectiveArgs`
-  expansion does. Unlocks `scalar/sum_values.test` directly; contributes to `geo_centroid`/
-  `geo_distance` (7a) and `overload/scalar_varargs_overload.test` (tier 2 item 9).
+- **7d. Vararg scalar functions.** ✅ Done. `VgiUnboundScalarFunction.tryBuild` no longer refuses a
+  trailing `vgi_varargs` argument (still refuses one that ISN'T trailing, and the `vgi_const` +
+  `vgi_varargs` combination, both with no clear wire meaning). `bind(StructType)` now accepts a
+  call-site arity of `declaredCount - 1` or more (the vararg group repeating 0+ times) and expands
+  the trailing spec to however many positions the call site actually has — each expanded position
+  independently resolved from `inputSchema`'s REAL type at that index (reusing 7b's `toArrowField`
+  reverse mapper), never refused for being dynamically-typed the way a plain fixed argument is,
+  since a repeating vararg group's whole point is per-call flexibility (confirmed necessary live:
+  `sum_values`'s `on_bind` computes its promoted return from just the FIRST expanded position's
+  type, e.g. `INTEGER` → `BIGINT`). **Also found and fixed, live**: a bare `NULL` literal with no
+  cast (e.g. `sum_values(1, NULL, 3)`) analyzes to Spark's `NullType`, which has no bridgeable Arrow
+  counterpart — this is NOT specific to varargs (any "any"-typed single-argument function hits the
+  identical case, e.g. `double(NULL)`) but was only ever exercised live by this item's NULL-handling
+  section. Since the wire cell is null regardless of its declared type, a `NullType` argument is now
+  substituted with a safe placeholder (`LongType`) rather than refused — the row-level RESULT is
+  correctly NULL either way. Unlocks `scalar/sum_values.test` as a curated conformance test (53/81
+  records; non-portable: `ATTACH`/`DETACH`, `typeof(...)` — same pre-existing casing gap as 7b/7c —
+  `unnest(generate_series(...))`, and every record referencing the three tables that file's own
+  skipped `CREATE TABLE ... unnest(generate_series(...))` would have populated). Contributes to
+  `geo_centroid`/`geo_distance` (7a) and `overload/scalar_varargs_overload.test` (tier 2 item 9).
 - **7e. Nested/complex return types** (e.g. `list<struct<...>>`). Same value-bridging work as 7a,
   return-side. Unlocks `scalar/unnest_tensor.test` — **1 file**, likely low priority (niche shape).
 
@@ -942,3 +957,10 @@ process. Worth adding to `VgiSqlLogicTestSweepTest`'s eligibility gate alongside
   fixed in both (they duplicate the same replay loop). Full `./gradlew :connector:test` green
   (53/53). Sweep: 624 → 659 passing records, still 19 files fully passing (`conditional_message.test`
   added as a curated test, 19/24 records — the other 5 are pre-existing, unrelated, documented gaps).
+- **2026-08-26** — Tier 2 item 7d (vararg scalar arguments) done. `bind(StructType)` now expands a
+  trailing `vgi_varargs` argument to the call site's real arity, resolving each expanded position's
+  type independently from `inputSchema`. Also found and fixed, live (not vararg-specific, just first
+  exercised by this item): a bare `NULL` literal analyzes to Spark's unbridgeable `NullType` — now
+  substituted with a safe placeholder type rather than refused, since the wire cell is null either
+  way. Full `./gradlew :connector:test` green (56/56). Sweep: 659 → 715 passing records, 19 → 20
+  files fully passing.
