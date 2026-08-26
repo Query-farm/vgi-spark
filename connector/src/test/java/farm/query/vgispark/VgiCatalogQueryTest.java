@@ -2,10 +2,17 @@
 
 package farm.query.vgispark;
 
+import farm.query.vgispark.scan.VgiScan;
 import farm.query.vgispark.testing.VgiWorkerHarness;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
+import org.apache.spark.sql.connector.catalog.Identifier;
+import org.apache.spark.sql.connector.catalog.SupportsRead;
+import org.apache.spark.sql.connector.catalog.Table;
+import org.apache.spark.sql.connector.read.ScanBuilder;
+import org.apache.spark.sql.connector.read.Statistics;
+import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeAll;
@@ -17,6 +24,7 @@ import java.io.File;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -344,5 +352,101 @@ class VgiCatalogQueryTest {
         assertEquals(5.0, r2.getDouble(0), 0.0001);
 
         spark.sql("RESET scale_factor");
+    }
+
+    /**
+     * Regression for {@code docs/ROADMAP.md} item 10 ({@code
+     * attach/ddl_wire_contract.test}): {@code VgiCatalog.createNamespace}/
+     * {@code alterTable} already refuse every mutating DDL statement with an
+     * {@link UnsupportedOperationException} — this pins that both the
+     * exception fires AND its message actually names the reason ("read-only"),
+     * rather than a generic/misleading one, for both entry points the real
+     * test file exercises.
+     *
+     * <p>{@code ALTER TABLE ... ADD/DROP COLUMN} in the real file targets
+     * {@code main.even_numbers}, which is a VIEW in the fixture worker's
+     * catalog (see {@code vgi-python/vgi/_test_fixtures/worker.py}) — this
+     * connector's {@link VgiCatalog} only surfaces {@code TABLE} catalog
+     * objects through Spark's {@code TableCatalog} SPI (views aren't wired up
+     * at all yet), so Spark's OWN analyzer fails to resolve the identifier
+     * before ever calling {@code alterTable} — a real, unavoidable
+     * {@code TABLE_OR_VIEW_NOT_FOUND} {@code AnalysisException}, not a bug in
+     * this connector's read-only refusal path. That's exercised (and left
+     * alone) by the curated conformance test's loose "did it throw"
+     * contract; this test instead points {@code ALTER TABLE} at a REAL table
+     * ({@code data.numbers}) so {@code alterTable()} is actually reached, to
+     * pin ITS message directly.
+     */
+    /**
+     * Regression for {@code docs/ROADMAP.md} tier 2 item 8 (column-statistics
+     * -driven scan pruning): {@link VgiScan#estimateStatistics()} must report
+     * the worker's real {@code TableInfo.cardinality_estimate}, not zero and
+     * not silently omit it — the fixture worker's {@code
+     * data.cardinality_inlined_table} declares {@code cardinality_estimate=10000}
+     * explicitly (see {@code vgi-python/vgi/_test_fixtures/worker.py}'s own
+     * comment: built for the C++ extension's identical {@code
+     * inlined_cardinality.test}), giving an exact expected value rather than
+     * an approximate one.
+     *
+     * <p>Goes around {@code spark.sql(...)} entirely and drives {@link
+     * VgiCatalog}/{@link SupportsRead#newScanBuilder} directly — the only
+     * clean way to reach the actual {@code Scan} object Spark's optimizer
+     * would call {@code estimateStatistics()} on, since that call happens
+     * deep inside Catalyst's own (non-public-API) plan nodes rather than
+     * anywhere {@code DataFrame} exposes directly.
+     */
+    @Test
+    @Timeout(60)
+    void reportsCardinalityFromTheWorkersEstimate() throws Exception {
+        VgiCatalog catalog = new VgiCatalog();
+        catalog.initialize("cardinality_probe", new CaseInsensitiveStringMap(
+                java.util.Map.of("location", worker.location(), "catalog-name", "example")));
+
+        // cardinality_inlined_table: a real, non-null TableInfo.cardinality_estimate (10000).
+        Table cardinalityTable = catalog.loadTable(Identifier.of(new String[] {"data"}, "cardinality_inlined_table"));
+        ScanBuilder cardinalityBuilder =
+                ((SupportsRead) cardinalityTable).newScanBuilder(CaseInsensitiveStringMap.empty());
+        VgiScan cardinalityScan = (VgiScan) cardinalityBuilder.build();
+        Statistics cardinalityStats = cardinalityScan.estimateStatistics();
+        assertTrue(cardinalityStats.numRows().isPresent(),
+                "expected a present row-count estimate for cardinality_inlined_table");
+        assertEquals(10000L, cardinalityStats.numRows().getAsLong());
+
+        // numbers: no cardinality_estimate declared at all (only column
+        // statistics) — must report UNKNOWN (empty), not 0 or a fabricated
+        // guess, exactly the "may be null" case VgiTable.cardinalityEstimate()
+        // itself documents.
+        Table numbersTable = catalog.loadTable(Identifier.of(new String[] {"data"}, "numbers"));
+        ScanBuilder numbersBuilder = ((SupportsRead) numbersTable).newScanBuilder(CaseInsensitiveStringMap.empty());
+        VgiScan numbersScan = (VgiScan) numbersBuilder.build();
+        Statistics numbersStats = numbersScan.estimateStatistics();
+        assertFalse(numbersStats.numRows().isPresent(),
+                "expected UNKNOWN (no cardinality_estimate declared), not a fabricated row count");
+    }
+
+    @Test
+    @Timeout(60)
+    void mutatingDdlRefusesWithAReadOnlyMessage() {
+        Exception createSchema = org.junit.jupiter.api.Assertions.assertThrows(UnsupportedOperationException.class,
+                () -> spark.sql("CREATE SCHEMA " + CATALOG + ".probe_schema").collect(),
+                "CREATE SCHEMA should be refused, not silently accepted");
+        assertTrue(createSchema.getMessage().toLowerCase().contains("read-only"),
+                "expected a read-only refusal message, got: " + createSchema.getMessage());
+
+        Exception createSchemaIfNotExists = org.junit.jupiter.api.Assertions.assertThrows(
+                UnsupportedOperationException.class,
+                () -> spark.sql("CREATE SCHEMA IF NOT EXISTS " + CATALOG + ".probe_schema2").collect(),
+                "CREATE SCHEMA IF NOT EXISTS should be refused, not silently accepted");
+        assertTrue(createSchemaIfNotExists.getMessage().toLowerCase().contains("read-only"),
+                "expected a read-only refusal message, got: " + createSchemaIfNotExists.getMessage());
+
+        // data.numbers is a real TABLE (not a view), so this actually reaches
+        // VgiCatalog.alterTable() — unlike the real test file's
+        // main.even_numbers target, see this test's own javadoc above.
+        Exception addColumn = org.junit.jupiter.api.Assertions.assertThrows(UnsupportedOperationException.class,
+                () -> spark.sql("ALTER TABLE " + CATALOG + ".data.numbers ADD COLUMN x INT").collect(),
+                "ALTER TABLE ... ADD COLUMN should be refused, not silently accepted");
+        assertTrue(addColumn.getMessage().toLowerCase().contains("read-only"),
+                "expected a read-only refusal message, got: " + addColumn.getMessage());
     }
 }

@@ -2,6 +2,7 @@
 
 package farm.query.vgispark.scan;
 
+import farm.query.vgi.client.ColumnStatisticsDecoder;
 import farm.query.vgi.protocol.BindRequest;
 import farm.query.vgi.protocol.BindResponse;
 import farm.query.vgi.protocol.PlanResponse;
@@ -12,17 +13,28 @@ import farm.query.vgispark.VgiCatalogConfig;
 import farm.query.vgispark.VgiTable;
 import farm.query.vgispark.branch.VgiScanBranch;
 import farm.query.vgispark.client.VgiWorkerClient;
+import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.spark.sql.connector.catalog.Column;
+import org.apache.spark.sql.connector.expressions.Expressions;
+import org.apache.spark.sql.connector.expressions.NamedReference;
 import org.apache.spark.sql.connector.read.Batch;
 import org.apache.spark.sql.connector.read.InputPartition;
 import org.apache.spark.sql.connector.read.PartitionReaderFactory;
 import org.apache.spark.sql.connector.read.Scan;
+import org.apache.spark.sql.connector.read.Statistics;
+import org.apache.spark.sql.connector.read.SupportsReportStatistics;
+import org.apache.spark.sql.connector.read.colstats.ColumnStatistics;
 import org.apache.spark.sql.types.DataTypes;
 import org.apache.spark.sql.types.StructField;
 import org.apache.spark.sql.types.StructType;
+import org.apache.spark.unsafe.types.UTF8String;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.OptionalLong;
 
 /**
  * A bound, planned VGI table scan.
@@ -43,7 +55,7 @@ import java.util.List;
  * VgiCatalogConfig#maxPlanPages()} — see that field's own javadoc for why
  * exceeding it throws rather than silently returning a partial plan.
  */
-public final class VgiScan implements Scan, Batch {
+public final class VgiScan implements Scan, Batch, SupportsReportStatistics {
 
     private final VgiWorkerClient client;
     private final VgiCatalogConfig config;
@@ -52,6 +64,13 @@ public final class VgiScan implements Scan, Batch {
     private final byte[] pushdownFiltersBytes;
     private final Long rowLimit;
     private final StructType readSchema;
+
+    // Lazily computed and cached: estimateStatistics() is an optimizer hook
+    // Spark's driver-side planning can call more than once for the same Scan
+    // (CBO, broadcast-join sizing, ...) — recomputing would mean a fresh
+    // catalog_table_column_statistics_get round trip per call for no benefit,
+    // since nothing about this immutable Scan's answer can change between calls.
+    private volatile Statistics cachedStatistics;
 
     /**
      * @param client the pooled connection to this catalog's VGI worker
@@ -106,6 +125,145 @@ public final class VgiScan implements Scan, Batch {
     public ColumnarSupportMode columnarSupportMode() {
         return ColumnarSupportMode.SUPPORTED;
     }
+
+    /**
+     * Row-count (and, best-effort, per-column) statistics for the optimizer —
+     * roadmap tier 2 item 8. {@code TableInfo.cardinality_estimate} is already
+     * threaded through onto {@link VgiTable} at table-load time (no extra RPC:
+     * see {@link VgiTable#cardinalityEstimate()}), so {@link #numRows} here is
+     * free. Per-column stats are NOT free — they need their own {@code
+     * catalog_table_column_statistics_get} round trip, fetched lazily and
+     * cached in {@link #cachedStatistics} the first time the optimizer asks.
+     *
+     * <p>{@code sizeInBytes} is deliberately {@link OptionalLong#empty()}
+     * rather than a guess: this connector has no column-width model to
+     * multiply a row count by (unlike {@code FileScan}'s compression-factor
+     * heuristic over an actual on-disk file size) and {@code TableInfo}
+     * doesn't offer a byte estimate directly — fabricating one would be a
+     * silent guess the "fail closed and loudly" philosophy elsewhere in this
+     * connector argues against, not a genuinely informative default.
+     *
+     * <p>Full "prune the scan away entirely at plan time" parity with what
+     * {@code table/column_statistics.test}'s {@code EXPLAIN} assertions check
+     * isn't attempted here (see the roadmap item's own note: Spark's
+     * constant-folding/pruning differs from DuckDB's) — this just reports
+     * honest numbers for Spark's own optimizer (join reordering, broadcast
+     * thresholds, {@code CBO} filter selectivity) to use however it already
+     * knows how to.
+     */
+    @Override
+    public Statistics estimateStatistics() {
+        Statistics cached = cachedStatistics;
+        if (cached != null) return cached;
+        Statistics computed = new VgiStatistics(
+                OptionalLong.empty(),
+                table.cardinalityEstimate() == null ? OptionalLong.empty() : OptionalLong.of(table.cardinalityEstimate()),
+                fetchColumnStatistics());
+        cachedStatistics = computed;
+        return computed;
+    }
+
+    /**
+     * Best-effort per-column stats via {@code catalog_table_column_statistics_get}
+     * (the same RPC {@code vgi-trino}'s {@code getTableStatistics} uses,
+     * unused by this connector before this item) — decoded with vgi-java's own
+     * {@link ColumnStatisticsDecoder}, the exact inverse of the worker-side
+     * serializer, rather than hand-rolling a second decoder here.
+     *
+     * <p>This is an OPTIMIZER HINT, not a correctness-bearing read — a worker
+     * that doesn't implement the RPC already answers with empty bytes (see
+     * {@code VgiService.catalog_table_column_statistics_get}'s own default),
+     * decoded as "no statistics" rather than an error, and a genuine
+     * connection failure here degrades the SAME way rather than aborting
+     * query planning entirely: unlike a wrong scan result, mis-estimated
+     * cardinality/selectivity is never a wrong ANSWER, only a worse plan, so
+     * swallowing the failure and reporting no column stats is the fail-closed
+     * choice here (query planning proceeding on an honest "unknown" belief),
+     * not a fail-open one.
+     */
+    private Map<NamedReference, ColumnStatistics> fetchColumnStatistics() {
+        byte[] raw;
+        try {
+            raw = client.withConnection(a -> a.service().catalog_table_column_statistics_get(
+                    a.handle(), table.schemaName(), table.tableName(), null, null));
+        } catch (RuntimeException e) {
+            return Map.of();
+        }
+        List<farm.query.vgi.catalog.ColumnStatistics> decoded;
+        try {
+            decoded = ColumnStatisticsDecoder.decode(raw);
+        } catch (IllegalStateException e) {
+            return Map.of();
+        }
+        if (decoded.isEmpty()) return Map.of();
+        Map<NamedReference, ColumnStatistics> out = new LinkedHashMap<>();
+        for (farm.query.vgi.catalog.ColumnStatistics s : decoded) {
+            out.put(Expressions.column(s.columnName()), toSparkColumnStatistics(s));
+        }
+        return Map.copyOf(out);
+    }
+
+    private ColumnStatistics toSparkColumnStatistics(farm.query.vgi.catalog.ColumnStatistics s) {
+        OptionalLong distinctCount = s.distinctCount() == null ? OptionalLong.empty() : OptionalLong.of(s.distinctCount());
+        OptionalLong maxLen = s.maxStringLength() == null ? OptionalLong.empty() : OptionalLong.of(s.maxStringLength());
+        return new VgiColumnStatistics(distinctCount, convertBound(s.arrowType(), s.min()),
+                convertBound(s.arrowType(), s.max()), deriveNullCount(s), maxLen);
+    }
+
+    /**
+     * {@code has_null}/{@code has_not_null} are booleans, not a count — an
+     * exact {@code nullCount} is only derivable at the two boundaries: no
+     * nulls at all (0), or every row is null (the table's own row-count
+     * estimate, when known). Anywhere in between is a genuine "some rows are
+     * null, unknown how many" — reported as {@link OptionalLong#empty()}
+     * rather than guessed.
+     */
+    private OptionalLong deriveNullCount(farm.query.vgi.catalog.ColumnStatistics s) {
+        if (!s.hasNull()) return OptionalLong.of(0L);
+        if (!s.hasNotNull()) {
+            Long cardinality = table.cardinalityEstimate();
+            return cardinality == null ? OptionalLong.empty() : OptionalLong.of(cardinality);
+        }
+        return OptionalLong.empty();
+    }
+
+    /**
+     * Converts a decoded VGI bound to the JVM representation
+     * {@code Statistics.scala}'s own scaladoc requires: CATALYST'S INTERNAL
+     * type for the column's Catalyst data type, not necessarily its external
+     * Java type — they coincide for the numeric types VGI's wire format
+     * carries (INT64 -> {@link Long}, matching {@code LongType}'s internal
+     * representation exactly; FLOAT64 -> {@link Double}, same story for
+     * {@code DoubleType}), but NOT for a UTF8 bound: Catalyst's internal
+     * representation for {@code StringType} is {@link UTF8String}, not
+     * {@link String}, so a plain decoded {@link String} is wrapped here
+     * rather than handed to the optimizer as-is (which risks a
+     * {@code ClassCastException} deep inside Catalyst's own filter-estimation
+     * code — confirmed by reading {@code DataSourceV2Relation}'s
+     * {@code transformV2Stats}, which passes this value through unconverted).
+     *
+     * <p>Anything else (geometry's WKB {@code binary} bounds, or an
+     * unrecognized union member) is omitted rather than guessed — this
+     * connector's {@code VgiTypeMapping} has no established Spark scalar type
+     * for a spatial bounding box, and a wrong guess here is worse than
+     * reporting "unknown".
+     */
+    private static Optional<Object> convertBound(ArrowType arrowType, Object value) {
+        if (value == null) return Optional.empty();
+        if (arrowType instanceof ArrowType.Utf8 || arrowType instanceof ArrowType.LargeUtf8) {
+            return Optional.of(UTF8String.fromString((String) value));
+        }
+        if (arrowType instanceof ArrowType.Int || arrowType instanceof ArrowType.FloatingPoint) {
+            return Optional.of(value);
+        }
+        return Optional.empty();
+    }
+
+    private record VgiStatistics(OptionalLong sizeInBytes, OptionalLong numRows,
+            Map<NamedReference, ColumnStatistics> columnStats) implements Statistics {}
+
+    private record VgiColumnStatistics(OptionalLong distinctCount, Optional<Object> min, Optional<Object> max,
+            OptionalLong nullCount, OptionalLong maxLen) implements ColumnStatistics {}
 
     @Override
     public InputPartition[] planInputPartitions() {

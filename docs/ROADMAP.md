@@ -407,7 +407,7 @@ off independently as needed — don't do all at once.
 ---
 
 ### 8. Column-statistics-driven scan pruning
-**Status:** ⬜ Not started
+**Status:** ✅ Done
 
 **What it is:** VGI's `catalog_table_column_statistics_get` RPC (used by vgi-trino's
 `getTableStatistics`, unused by vgi-spark today) surfaces per-column min/max/null-count/distinct-
@@ -416,14 +416,61 @@ row-count and size estimates the optimizer can use for join reordering, broadcas
 (via `SupportsPushDownFilters` + the optimizer's own constant-folding) plan-time pruning when a
 predicate provably can't match any row.
 
-**What's needed:** thread `TableInfo.cardinality_estimate` and per-column stats into a
-`Statistics` implementation on `VgiScan`. Full "prune the scan away entirely at plan time" parity
-with what `table/column_statistics.test`'s `EXPLAIN` assertions check isn't achievable (Spark's own
-constant-folding/pruning behavior differs from DuckDB's), but real cardinality reporting is
-independently valuable (join planning) and directly addressable.
+**What shipped:** `VgiScan implements SupportsReportStatistics`. `estimateStatistics().numRows()`
+reports `table.cardinalityEstimate()` directly (already threaded onto `VgiTable` — no extra RPC,
+no change to `VgiTable` needed) as `OptionalLong.of(...)` when the worker offered one, `OptionalLong
+.empty()` (never a fabricated 0) when it didn't. `columnStats()` goes further than the v1 floor:
+a lazily-fetched, per-`Scan`-cached call to `catalog_table_column_statistics_get`, decoded with
+vgi-java's own `ColumnStatisticsDecoder` (no new decoder needed — it already exists for
+`vgi-trino`'s identical use), mapped into Spark's `colstats.ColumnStatistics` shape. `distinctCount`/
+`maxLen` pass through directly; `nullCount` is derived only at the two boundaries the wire's
+`has_null`/`has_not_null` booleans actually pin (0, or the table's own cardinality estimate when
+every row is null) — anywhere in between is reported unknown, not guessed. `min`/`max` are converted
+to Catalyst's INTERNAL representation for the column's Spark type (confirmed by reading
+`Statistics.scala`'s own scaladoc and `DataSourceV2Relation.transformV2Stats`, which passes the raw
+value through unconverted): INT64/FLOAT64 pass through as-is (internal and external representations
+coincide for `LongType`/`DoubleType`), UTF8 is wrapped in `UTF8String.fromString` (Catalyst's actual
+internal `StringType` representation — a plain `String` here risks a `ClassCastException` deep in
+Catalyst's own filter-estimation code, not just a worse plan). Geometry/binary bounds and any other
+union member are omitted rather than guessed — `VgiTypeMapping` has no established Spark scalar type
+for a WKB bounding box. `sizeInBytes` stays `OptionalLong.empty()`: no honest per-row byte model
+exists to multiply a row count by (unlike `FileScan`'s compression-factor-over-real-file-size
+heuristic), and fabricating one would violate this connector's own fail-closed philosophy. Column-
+stats fetch failures (RPC error, malformed bytes) degrade to "no column stats" rather than aborting
+query planning — a worker that doesn't implement the RPC already answers with empty bytes (the
+`VgiService` default), and mis-estimated statistics are never a WRONG scan answer, only a
+less-optimized plan, so swallowing the failure is the fail-closed choice here.
 
-**Unlocks:** the correctness-bearing (non-`EXPLAIN`) portion of `table/column_statistics.test` —
-partial credit only, since several of its records assert DuckDB `EXPLAIN` plan text specifically.
+**Unlocks — verified:**
+- `table/column_statistics.test` — the correctness-bearing portion now passes as a curated
+  conformance test (`VgiSqlLogicTestConformanceTest.columnStatisticsMatchesTheRealTestFile`, 9
+  executed / 65 skipped). Partial credit only, as this item originally anticipated: every skip is
+  either a DuckDB `EXPLAIN` physical-plan-text assertion (20 records — this runner's plain
+  string-per-cell comparison has no `<REGEX>:` support, and Spark's own `EXPLAIN` doesn't emit a
+  `physical_plan`-named two-cell row the way DuckDB's does — confirmed by actually running one, a
+  literal mismatch, not a near-miss) or the DuckDB-only `vgi_table_statistics()` diagnostic
+  table-valued function (44 records — no Spark SQL-level table-function-call syntax to reach an
+  equivalent). The 9 that DO execute are real: plain `count(*)`/`SELECT *` reads against every
+  fixture table the stats-bearing records exercise, including the zero-TTL (`volatile_numbers`) and
+  no-statistics-at-all (`versioned_data`) cases — proving column-stats fetching (or its absence)
+  doesn't perturb an ordinary scan either way.
+- New live regression: `VgiCatalogQueryTest.reportsCardinalityFromTheWorkersEstimate` — confirms
+  `data.cardinality_inlined_table`'s declared `cardinality_estimate=10000` comes back as a present
+  `10000L`, and `data.numbers` (no `cardinality_estimate` declared) comes back UNKNOWN, not a
+  fabricated `0` or a copied-from-stats guess.
+- Real cardinality reporting is independently useful for join planning regardless of the `EXPLAIN`
+  ceiling, exactly as this item's original "What it is" argued.
+
+**Not attempted / caveats:** full "prune the scan away entirely at plan time" parity with the real
+test file's `EXPLAIN` assertions was never in scope (Spark's constant-folding/pruning differs from
+DuckDB's). Geometry-typed (WKB binary) min/max bounds are reported as absent, not converted —
+`geo_points`'s stats are real per the worker fixture, but this connector has no established
+Catalyst-internal representation for a spatial bounding box to convert into safely.
+
+**Verification:** `connector/src/main/java/farm/query/vgispark/scan/VgiScan.java`
+(`estimateStatistics`, `fetchColumnStatistics`, `convertBound`). Tests:
+`VgiSqlLogicTestConformanceTest.columnStatisticsMatchesTheRealTestFile` (curated, real file) +
+`VgiCatalogQueryTest.reportsCardinalityFromTheWorkersEstimate` (live, direct `VgiCatalog` use).
 
 ---
 
@@ -443,7 +490,7 @@ assuming one.
 ---
 
 ### 10. Catalog-DDL mutation refusal path
-**Status:** ⬜ Not started — cheap, no new protocol work
+**Status:** ✅ Done
 
 **What it is:** `attach/ddl_wire_contract.test` expects `CREATE SCHEMA`/`ALTER TABLE ... ADD/DROP
 COLUMN` against a read-only VGI catalog to fail with a specific `catalog is read-only`-shaped error
@@ -452,11 +499,30 @@ COLUMN` against a read-only VGI catalog to fail with a specific `catalog is read
 is purely whether the message/error shape matches what this file expects, and whether Spark's own
 analyzer even reaches our code for these statements or fails earlier with a generic error.
 
-**What's needed:** read the file, run the two statements today, see what actually happens, adjust
-error wording/shape to match if it's a simple mismatch. Likely a very small, self-contained fix —
-good candidate to just do rather than research further.
+**What shipped:** no production code change was needed — `VgiCatalog.createNamespace`/`alterTable`
+already throw `UnsupportedOperationException` with a message that names "read-only" clearly whenever
+those methods are actually reached. What was missing was verification: run the real file's
+statements live against a real worker and confirm the *shape* of the failure, not assume it.
+Findings, confirmed by actually running each statement:
+- `CREATE SCHEMA` / `CREATE SCHEMA IF NOT EXISTS` reach `VgiCatalog.createNamespace` directly and
+  throw a clear `UnsupportedOperationException` ("...read-only...cannot create a namespace").
+- `CREATE OR REPLACE SCHEMA` isn't valid Spark SQL at all — Spark's own parser rejects it
+  (`[PARSE_SYNTAX_ERROR] Syntax error at or near 'SCHEMA'`) before this connector is even involved.
+  Still throws, so it's fine under this suite's loose "did it throw" `STATEMENT_ERROR` contract.
+- `ALTER TABLE ... ADD/DROP COLUMN` in the real file target `main.even_numbers`, which is a VIEW in
+  the fixture worker's catalog, not a TABLE. `VgiCatalog` doesn't surface views through Spark's
+  `TableCatalog` SPI at all yet, so Spark's own analyzer fails to resolve the identifier
+  (`TABLE_OR_VIEW_NOT_FOUND`) before `alterTable()` is ever called — a real, unavoidable divergence
+  given this connector's current scope, not a bug in the read-only refusal path. Confirmed separately
+  that `ALTER TABLE` against a REAL table (`data.numbers`) DOES reach `alterTable()` and throws the
+  same clear read-only message.
 
-**Unlocks:** `attach/ddl_wire_contract.test` — **1 file**.
+**Unlocks — verified:** `attach/ddl_wire_contract.test` — 1 file, as a curated conformance test
+(`ddlWireContractMatchesTheRealTestFile`, 2 skipped: `ATTACH`/`DETACH`, 7 executed — all 7 throw, via
+the two different routes above). Plus a live regression test
+(`VgiCatalogQueryTest.mutatingDdlRefusesWithAReadOnlyMessage`) pinning the actual message content
+("read-only") on both `createNamespace` and `alterTable` directly, since the curated suite's
+`STATEMENT_ERROR` contract only checks "did it throw," never message wording.
 
 ---
 
@@ -673,3 +739,12 @@ process. Worth adding to `VgiSqlLogicTestSweepTest`'s eligibility gate alongside
   `spark.newSession()` per file). `settings/multiply_by_setting.test` and `settings_types.test` now
   pass as curated conformance tests; general sweep 443 → 519 passing records (the default-schema fix
   reaches well beyond just these two files).
+- **2026-08-25** — Tier 2 items 8 (column-statistics) and 10 (DDL mutation refusal) done, implemented
+  in parallel by two coordinated subagents (a Workflow run: file-disjoint scope, each verified against
+  a live worker independently, integrated and re-verified together afterward). Item 8 went beyond its
+  v1 floor to include per-column min/max/null-count/distinct-count, not just row-count. Item 10 needed
+  zero production code — existing error messages already satisfied the file, verification was the
+  actual work, and surfaced a real (unrelated) scope note: `ALTER TABLE` against the real file's
+  `main.even_numbers` never reaches `VgiCatalog` at all today, since it's a VIEW and views aren't yet
+  surfaced through `TableCatalog`. `table/column_statistics.test` (partial credit, 9/74 records) and
+  `attach/ddl_wire_contract.test` (full file, 7/7 records) now pass as curated conformance tests.

@@ -307,4 +307,138 @@ class VgiSqlLogicTestConformanceTest {
         assertEquals(3, result.skipped(), "expected skip count changed — see SETTINGS_TYPES_NON_PORTABLE_MARKERS");
         assertEquals(5, result.executed(), "expected executed-record count changed");
     }
+
+    /**
+     * {@code attach/ddl_wire_contract.test} (see {@code docs/ROADMAP.md},
+     * tier 1 item 10): pins that mutating catalog DDL against this read-only
+     * connector fails, not succeeds — every {@code statement error} record
+     * expects {@code catalog is read-only}, but per this runner's own
+     * {@code STATEMENT_ERROR} contract (see {@link SqlLogicTestRunner}) only
+     * "did it throw" is checked, never the exact wording, so this test
+     * doesn't (and can't) pin the literal DuckDB-side message text.
+     *
+     * <p>Every record here DOES throw when replayed, but by two different
+     * routes, confirmed by actually running each statement (not assumed):
+     * <ul>
+     *   <li>{@code CREATE SCHEMA}/{@code CREATE SCHEMA IF NOT EXISTS} reach
+     *       {@link VgiCatalog#createNamespace} directly, which already
+     *       throws a clear {@link UnsupportedOperationException} naming
+     *       "read-only" — see {@code VgiCatalogQueryTest
+     *       .mutatingDdlRefusesWithAReadOnlyMessage} for a message-content
+     *       pin on that path.</li>
+     *   <li>{@code CREATE OR REPLACE SCHEMA} isn't valid Spark SQL at all
+     *       ({@code CREATE OR REPLACE} has no schema/namespace form in
+     *       Spark's grammar — confirmed by running it: {@code
+     *       [PARSE_SYNTAX_ERROR] Syntax error at or near 'SCHEMA'}) — a
+     *       Spark dialect gap, unrelated to this connector, but it still
+     *       throws, so the loose contract above is satisfied without a
+     *       marker.</li>
+     *   <li>{@code ALTER TABLE ... ADD/DROP COLUMN} target {@code
+     *       main.even_numbers}, which is a VIEW in the real fixture worker's
+     *       catalog, not a TABLE (see {@code
+     *       vgi-python/vgi/_test_fixtures/worker.py}'s {@code main} schema:
+     *       no {@code tables=[...]}, only {@code views=[...]}). This
+     *       connector's {@link VgiCatalog} doesn't surface views through
+     *       Spark's {@code TableCatalog} SPI at all yet, so Spark's own
+     *       analyzer fails to resolve the identifier ({@code
+     *       TABLE_OR_VIEW_NOT_FOUND}) before {@code VgiCatalog.alterTable}
+     *       is ever called — confirmed directly by also running {@code
+     *       ALTER TABLE} against a REAL table ({@code data.numbers}), which
+     *       DOES reach {@code alterTable()} and throws the same clear
+     *       "read-only" message as {@code createNamespace} (also pinned by
+     *       {@code VgiCatalogQueryTest
+     *       .mutatingDdlRefusesWithAReadOnlyMessage}). Still a genuine
+     *       "statement error" either way, so no marker needed here either —
+     *       this is exactly the "Spark's own analyzer doesn't even reach our
+     *       code" case {@code docs/ROADMAP.md} flagged as a possibility for
+     *       this item, and it turned out not to need a fix: nothing here
+     *       silently succeeds, and no message is confusing enough to be
+     *       worth improving.</li>
+     * </ul>
+     *
+     * <p>Only {@code ATTACH}/{@code DETACH} are non-portable (same reason as
+     * every other curated test here — the harness attaches via {@code
+     * spark.sql.catalog.*} config instead of a real {@code ATTACH}
+     * statement).
+     */
+    private static final List<String> DDL_WIRE_CONTRACT_NON_PORTABLE_MARKERS = List.of("ATTACH ", "DETACH");
+
+    @Test
+    @Timeout(180)
+    void ddlWireContractMatchesTheRealTestFile() throws Exception {
+        Path testFile = VGI_TEST_ROOT.toPath().resolve("attach/ddl_wire_contract.test");
+        Assumptions.assumeTrue(testFile.toFile().isFile(), testFile + " not present");
+
+        SqlLogicTestRunner.Result result = SqlLogicTestRunner.run(spark, testFile,
+                "example.", SPARK_CATALOG, DDL_WIRE_CONTRACT_NON_PORTABLE_MARKERS);
+
+        if (!result.failures().isEmpty()) {
+            fail(result.executed() + " executed, " + result.skipped() + " skipped, "
+                    + result.failures().size() + " FAILED:\n" + String.join("\n---\n", result.failures()));
+        }
+        // 2 non-portable: ATTACH, DETACH. The other 7 (3x CREATE SCHEMA, 2x
+        // ADD COLUMN, 2x DROP COLUMN) all execute and all throw — see this
+        // test's own javadoc for exactly how each one fails.
+        assertEquals(2, result.skipped(), "expected skip count changed — see DDL_WIRE_CONTRACT_NON_PORTABLE_MARKERS");
+        assertEquals(7, result.executed(), "expected executed-record count changed");
+    }
+
+    /**
+     * {@code table/column_statistics.test} (see {@code docs/ROADMAP.md},
+     * tier 2 item 8): the correctness-bearing (non-{@code EXPLAIN}) portion
+     * only, per that item's own "Unlocks" note — partial credit, since most
+     * of this file's records assert DuckDB {@code EXPLAIN} physical-plan
+     * text specifically, which has no portable equivalent here (confirmed by
+     * actually running one: this runner's {@code query} record contract is
+     * plain string-per-cell comparison, no {@code <REGEX>:} support, and
+     * Spark's own {@code EXPLAIN} doesn't emit a {@code physical_plan}
+     * column-named two-cell row the way DuckDB's {@code EXPLAIN} does — a
+     * literal-text mismatch on every single one, not a near-miss).
+     *
+     * <p>Non-portable, beyond {@code ATTACH}:
+     * <ul>
+     *   <li>{@code "EXPLAIN "} — every {@code EXPLAIN SELECT ...} record in
+     *       this file, all asserting a DuckDB-specific {@code <REGEX>:
+     *       .*EMPTY_RESULT.*}/{@code .*VGI_TABLE_SCAN.*} physical-plan
+     *       string — see above.</li>
+     *   <li>{@code "vgi_table_statistics("} — DuckDB's own diagnostic
+     *       table-valued function surfacing {@code
+     *       catalog_table_column_statistics_get}'s raw per-column output
+     *       (min/max/distinct_count/has_null/...); Spark has no SQL-level
+     *       table-function-call syntax to reach an equivalent (see the
+     *       plan's non-goals) and this connector doesn't register one.</li>
+     * </ul>
+     *
+     * <p>What's left is genuinely correctness-bearing, not just filler: plain
+     * {@code count(*)}/{@code SELECT *} reads against the SAME fixture tables
+     * ({@code numbers}, {@code departments}, {@code products}, {@code colors},
+     * {@code versioned_data}, {@code volatile_numbers}) the stats-bearing
+     * records exercise, proving those tables read correctly end-to-end
+     * through {@link farm.query.vgispark.scan.VgiScan} — including the one
+     * whose declared statistics have TTL {@code 0} ({@code
+     * volatile_numbers}) and the one with NO statistics at all ({@code
+     * versioned_data}), i.e. {@code Statistics}/column-stats fetching (or its
+     * absence) doesn't perturb an ordinary scan either way.
+     */
+    private static final List<String> COLUMN_STATISTICS_NON_PORTABLE_MARKERS =
+            List.of("ATTACH ", "EXPLAIN ", "vgi_table_statistics(");
+
+    @Test
+    @Timeout(180)
+    void columnStatisticsMatchesTheRealTestFile() throws Exception {
+        Path testFile = VGI_TEST_ROOT.toPath().resolve("table/column_statistics.test");
+        Assumptions.assumeTrue(testFile.toFile().isFile(), testFile + " not present");
+
+        SqlLogicTestRunner.Result result = SqlLogicTestRunner.run(spark, testFile,
+                "example.", SPARK_CATALOG, COLUMN_STATISTICS_NON_PORTABLE_MARKERS);
+
+        if (!result.failures().isEmpty()) {
+            fail(result.executed() + " executed, " + result.skipped() + " skipped, "
+                    + result.failures().size() + " FAILED:\n" + String.join("\n---\n", result.failures()));
+        }
+        // 65 non-portable: 1x ATTACH, 20x EXPLAIN, 44x vgi_table_statistics(). The other 9
+        // (plain count(*)/SELECT * reads) execute and match.
+        assertEquals(65, result.skipped(), "expected skip count changed — see COLUMN_STATISTICS_NON_PORTABLE_MARKERS");
+        assertEquals(9, result.executed(), "expected executed-record count changed");
+    }
 }
