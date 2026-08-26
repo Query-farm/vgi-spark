@@ -73,7 +73,14 @@ final class SqlLogicTestRunner {
                             List<String> cells = new ArrayList<>(row.length());
                             for (int i = 0; i < row.length(); i++) {
                                 Object v = row.isNullAt(i) ? null : row.get(i);
-                                cells.add(v == null ? "NULL" : v.toString());
+                                // "(empty)" is DuckDB sqllogictest's own convention for an
+                                // empty-string cell in a .test file's expected-output block
+                                // (first surfaced by scalar/conditional_message.test, which
+                                // returns "" for a false condition) — mirror it on the actual
+                                // side the same way "NULL" already mirrors a null cell, rather
+                                // than comparing the sentinel token against a literal "".
+                                String s = v == null ? "NULL" : v.toString();
+                                cells.add(s.isEmpty() ? "(empty)" : s);
                             }
                             actual.add(cells);
                         }

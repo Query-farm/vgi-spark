@@ -503,4 +503,44 @@ class VgiSqlLogicTestConformanceTest {
         assertEquals(2, result.skipped(), "expected skip count changed — see AGGREGATE_GROUPED_NON_PORTABLE_MARKERS");
         assertEquals(5, result.executed(), "expected executed-record count changed");
     }
+
+    /**
+     * {@code scalar/conditional_message.test} (roadmap tier 2 item 7c):
+     * {@code conditional_message(repeat_count, message, condition)} has TWO
+     * {@code vgi_const} arguments ({@code repeat_count}, {@code message}) and
+     * one plain per-row column argument ({@code condition}) — exercises
+     * {@code VgiScalarFunction}'s lazy const-bind cache repeatedly across
+     * many distinct observed const-argument combinations within one query,
+     * including its "rebind on change" path (the const values genuinely
+     * differ record to record) and, in the file's own regression record, a
+     * VARCHAR-literal-to-BIGINT implicit cast at the {@code repeat_count}
+     * position. Non-portable: {@code ATTACH}/{@code DETACH}, and the two
+     * records using {@code unnest(generate_series(...))} (a DuckDB-only
+     * table-valued function unrelated to VGI or this item), and the one
+     * {@code typeof(...)} record — a pre-existing, corpus-wide, unrelated
+     * gap already noted under roadmap item 7b: the runner does no DuckDB→
+     * Spark {@code typeof()} string normalization ({@code "VARCHAR"} vs.
+     * {@code "string"}), so every {@code typeof()} record anywhere in the
+     * corpus already mismatches on naming regardless of this item.
+     */
+    private static final List<String> CONDITIONAL_MESSAGE_NON_PORTABLE_MARKERS =
+            List.of("ATTACH ", "DETACH", "unnest(generate_series", "typeof(");
+
+    @Test
+    @Timeout(180)
+    void conditionalMessageMatchesTheRealTestFile() throws Exception {
+        Path testFile = VGI_TEST_ROOT.toPath().resolve("scalar/conditional_message.test");
+        Assumptions.assumeTrue(testFile.toFile().isFile(), testFile + " not present");
+
+        SqlLogicTestRunner.Result result = SqlLogicTestRunner.run(spark, testFile,
+                "example.", SPARK_CATALOG, CONDITIONAL_MESSAGE_NON_PORTABLE_MARKERS);
+
+        if (!result.failures().isEmpty()) {
+            fail(result.executed() + " executed, " + result.skipped() + " skipped, "
+                    + result.failures().size() + " FAILED:\n" + String.join("\n---\n", result.failures()));
+        }
+        assertEquals(5, result.skipped(),
+                "expected skip count changed — see CONDITIONAL_MESSAGE_NON_PORTABLE_MARKERS");
+        assertEquals(19, result.executed(), "expected executed-record count changed");
+    }
 }

@@ -334,7 +334,14 @@ class VgiSqlLogicTestSweepTest {
                             List<String> cells = new ArrayList<>(row.length());
                             for (int i = 0; i < row.length(); i++) {
                                 Object v = row.isNullAt(i) ? null : row.get(i);
-                                cells.add(v == null ? "NULL" : v.toString());
+                                // "(empty)" is DuckDB sqllogictest's own convention for an
+                                // empty-string cell — mirrored on the actual side the same way
+                                // "NULL" already mirrors a null cell. Kept in sync with
+                                // SqlLogicTestRunner's identical normalization (this class
+                                // duplicates that replay loop rather than reusing it, for its
+                                // own per-file bookkeeping — see this class's own notes).
+                                String s = v == null ? "NULL" : v.toString();
+                                cells.add(s.isEmpty() ? "(empty)" : s);
                             }
                             actual.add(cells);
                         }

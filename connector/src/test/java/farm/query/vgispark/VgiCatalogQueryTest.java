@@ -558,4 +558,43 @@ class VgiCatalogQueryTest {
                 .collectAsList().get(0);
         assertEquals(0, new java.math.BigDecimal("3.750").compareTo(result.getDecimal(0)));
     }
+
+    @Test
+    @Timeout(60)
+    void scalarFunctionAcceptsConstArguments() {
+        // conditional_message(repeat_count, message, condition) — roadmap item
+        // 7c: repeat_count/message are vgi_const arguments, whose VALUES (not
+        // just types) are resolved lazily in VgiScalarFunction.produceResult,
+        // not at VgiUnboundScalarFunction.bind() time (Spark's bind(StructType)
+        // sees only types). condition is a plain per-row column argument.
+        List<Row> rows = spark.sql("SELECT " + CATALOG + ".conditional_message(3, 'Hi', true) AS a, "
+                        + CATALOG + ".conditional_message(3, 'Hello', false) AS b, "
+                        + CATALOG + ".conditional_message(1, 'Hello', true) AS c, "
+                        + CATALOG + ".conditional_message(0, 'Test', true) AS d")
+                .collectAsList();
+        Row result = rows.get(0);
+        assertEquals("HiHiHi", result.getString(0));
+        assertEquals("", result.getString(1));
+        assertEquals("Hello", result.getString(2));
+        assertEquals("", result.getString(3));
+    }
+
+    @Test
+    @Timeout(60)
+    void scalarFunctionRebindsWhenAConstArgumentValueChangesAcrossRows() {
+        // Same call site, but the const arguments genuinely vary per row (a
+        // literal SQL expression per call is one call site each above; this
+        // exercises the SAME BoundFunction instance seeing a DIFFERENT
+        // observed const value across successive produceResult() calls, via
+        // a table of rows rather than distinct call sites) — the "rebind on
+        // change" path in VgiScalarFunction.produceResult, not just the
+        // "bind once, reuse" happy path.
+        List<Row> rows = spark.sql(
+                        "SELECT " + CATALOG + ".conditional_message(n, 'x', true) AS r "
+                                + "FROM (VALUES (1), (2), (3), (2), (1)) t(n) ORDER BY t.n")
+                .collectAsList();
+        // Sorted by n: 1,1,2,2,3 -> x, x, xx, xx, xxx
+        List<String> actual = rows.stream().map(r -> r.getString(0)).toList();
+        assertEquals(List.of("x", "x", "xx", "xx", "xxx"), actual);
+    }
 }

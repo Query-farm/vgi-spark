@@ -30,13 +30,17 @@ import java.util.Map;
  * A discovered, not-yet-bound VGI scalar function.
  *
  * <p>{@link #bind} does the actual VGI {@code bind()} RPC — once, on the
- * driver, when Spark resolves a call site during query analysis (unlike
- * {@code vgi-trino}'s {@code VgiScalarFunctions.BindCache}, which needs a
- * cache because Trino's {@code instanceFactory} runs once per {@code Driver}
- * with no visibility into per-call constant argument values; Spark calls
- * {@code bind(StructType)} exactly once per call site with nothing to
- * re-bind for later, since v1 supports no constant arguments at all — see
- * this class's own validation).
+ * driver, when Spark resolves a call site during query analysis, PROVIDED
+ * the function has no {@code vgi_const} argument. A {@code vgi_const}
+ * argument's VALUE (not just its type) is unknowable at this point — Spark's
+ * {@code bind(StructType)} sees types only — so for a const-bearing function
+ * this method does no RPC at all and instead builds a {@link
+ * VgiScalarFunction} that binds lazily, per observed value, the first time
+ * (and again whenever it changes) {@code produceResult} actually sees a row;
+ * see {@link VgiScalarFunction}'s own javadoc for the full rationale (the
+ * same limitation {@code vgi-trino}'s {@code VgiScalarFunctions.BindCache}
+ * exists to work around, simplified here since Spark already scopes one
+ * {@code VgiScalarFunction} instance to one call site).
  *
  * <p><strong>Return type is resolved from the REAL {@code bind()} response,
  * not static discovery-time metadata</strong> — see {@link #bind}. A VGI
@@ -71,11 +75,12 @@ final class VgiUnboundScalarFunction implements UnboundFunction {
     private final Schema argsSchema;
     private final DataType[] inputTypes;
     private final boolean[] anyArgs;
+    private final boolean[] constArgs;
     private final boolean deterministic;
 
     private VgiUnboundScalarFunction(VgiWorkerClient client, VgiCatalogConfig config, String schemaName,
             FunctionInfo info, Schema argsSchema, DataType[] inputTypes, boolean[] anyArgs,
-            boolean deterministic) {
+            boolean[] constArgs, boolean deterministic) {
         this.client = client;
         this.config = config;
         this.schemaName = schemaName;
@@ -83,6 +88,7 @@ final class VgiUnboundScalarFunction implements UnboundFunction {
         this.argsSchema = argsSchema;
         this.inputTypes = inputTypes;
         this.anyArgs = anyArgs;
+        this.constArgs = constArgs;
         this.deterministic = deterministic;
     }
 
@@ -104,68 +110,84 @@ final class VgiUnboundScalarFunction implements UnboundFunction {
                     context + " takes " + inputTypes.length + " argument(s), got " + inputSchema.length());
         }
 
-        // Resolve any "any"-typed arguments from THIS call site's real,
-        // concrete Spark argument types — see this class's own javadoc.
-        // Non-"any" arguments keep their statically-discovered field/type
-        // unchanged.
-        DataType[] resolvedInputTypes = inputTypes;
-        Schema resolvedArgsSchema = argsSchema;
-        boolean anyDynamic = false;
-        for (boolean b : anyArgs) if (b) { anyDynamic = true; break; }
-        if (anyDynamic) {
-            List<Field> staticFields = argsSchema.getFields();
-            List<Field> resolvedFields = new java.util.ArrayList<>(staticFields);
-            resolvedInputTypes = inputTypes.clone();
-            for (int i = 0; i < anyArgs.length; i++) {
-                if (!anyArgs[i]) continue;
-                org.apache.spark.sql.types.StructField callSiteField = inputSchema.fields()[i];
-                DataType realType = callSiteField.dataType();
-                if (!VgiScalarValueBridge.isSupported(realType)) {
-                    throw new UnsupportedOperationException(context + ": argument '" + staticFields.get(i).getName()
-                            + "' is any-typed and this call site's real type " + realType
-                            + " is not bridged (struct/list/map arguments are a later phase)");
-                }
-                resolvedInputTypes[i] = realType;
-                resolvedFields.set(i, farm.query.vgispark.types.VgiTypeMapping.toArrowField(
-                        staticFields.get(i).getName(), realType, callSiteField.nullable()));
+        // Resolve any "any"-typed arguments (const or not) from THIS call
+        // site's real, concrete Spark argument types — see this class's own
+        // javadoc. Non-"any" arguments keep their statically-discovered
+        // field/type unchanged. Always builds a full-length resolved field
+        // list (even when nothing actually changed) since both the eager
+        // and const-deferred paths below need it uniformly.
+        DataType[] resolvedInputTypes = inputTypes.clone();
+        List<Field> resolvedFields = new java.util.ArrayList<>(argsSchema.getFields());
+        for (int i = 0; i < anyArgs.length; i++) {
+            if (!anyArgs[i]) continue;
+            org.apache.spark.sql.types.StructField callSiteField = inputSchema.fields()[i];
+            DataType realType = callSiteField.dataType();
+            if (!VgiScalarValueBridge.isSupported(realType)) {
+                throw new UnsupportedOperationException(context + ": argument '" + resolvedFields.get(i).getName()
+                        + "' is any-typed and this call site's real type " + realType
+                        + " is not bridged (struct/list/map arguments are a later phase)");
             }
-            resolvedArgsSchema = new Schema(resolvedFields);
+            resolvedInputTypes[i] = realType;
+            resolvedFields.set(i, farm.query.vgispark.types.VgiTypeMapping.toArrowField(
+                    resolvedFields.get(i).getName(), realType, callSiteField.nullable()));
         }
 
-        byte[] emptyArguments = ArgumentsEncoder.builder().encode();
-        byte[] inputSchemaBytes = ArrowSchemaCodec.serializeSchema(resolvedArgsSchema);
-        BindRequest bindRequest = new BindRequest(
-                info.name(),
-                emptyArguments,
-                "SCALAR",
-                inputSchemaBytes,
-                currentSettingsBytes(client),
-                null,           // secrets — deferred, see class javadoc
-                null,           // attach_opaque_data — filled in per-connection below
-                null,           // transaction_opaque_data
-                false,          // resolved_secrets_provided
-                null, null,     // at_unit / at_value — not applicable to scalars
-                null, null,     // copy_from / copy_to
-                schemaName);
+        boolean hasConstArgs = false;
+        for (boolean b : constArgs) if (b) { hasConstArgs = true; break; }
 
-        byte[][] attachHandleUsed = new byte[1][];
-        BindResponse[] boundHolder = new BindResponse[1];
-        byte[] opaqueData = client.withConnection(a -> {
-            attachHandleUsed[0] = a.handle();
-            BindResponse bound = a.service().bind(withAttachHandle(bindRequest, a.handle()), null);
-            boundHolder[0] = bound;
-            return bound.opaque_data();
-        });
-        byte[] bindCallBytes = RecordCodec.serializeToBytes(withAttachHandle(bindRequest, attachHandleUsed[0]));
+        // Row (non-const) vs. const argument split, in signature order —
+        // identical to [0..n) / [] when there are no const arguments at all.
+        List<Integer> rowIdx = new java.util.ArrayList<>();
+        List<Integer> constIdx = new java.util.ArrayList<>();
+        List<Field> rowFields = new java.util.ArrayList<>();
+        for (int i = 0; i < resolvedInputTypes.length; i++) {
+            if (constArgs[i]) constIdx.add(i);
+            else { rowIdx.add(i); rowFields.add(resolvedFields.get(i)); }
+        }
+        int[] rowArgIndices = rowIdx.stream().mapToInt(Integer::intValue).toArray();
+        int[] constArgIndices = constIdx.stream().mapToInt(Integer::intValue).toArray();
+        Schema rowInputSchema = new Schema(rowFields);
+        byte[] rowInputSchemaBytes = ArrowSchemaCodec.serializeSchema(rowInputSchema);
+        Field[] resolvedFieldsArray = resolvedFields.toArray(new Field[0]);
 
-        // InitRequest.output_schema is the RESULT batch's schema (one "result"
-        // column of the return type) — BindResponse.output_schema(), NOT this
-        // function's own input schema. Conflating the two here previously sent
-        // the wrong declared shape to every init() call.
-        byte[] outputSchemaBytes = boundHolder[0].output_schema();
-        DataType returnType = resolveReturnType(outputSchemaBytes);
-        return new VgiScalarFunction(config, info.name(), bindCallBytes, outputSchemaBytes, opaqueData,
-                inputSchemaBytes, resolvedInputTypes, returnType, deterministic);
+        if (!hasConstArgs) {
+            // No vgi_const arguments: unchanged from before this class
+            // supported them — bind ONCE, now, on the driver, and replay the
+            // same bindCallBytes/opaqueData at every later init() call,
+            // wherever Spark schedules this call site's rows.
+            byte[] emptyArguments = ArgumentsEncoder.builder().encode();
+            BindRequest bindRequest = new BindRequest(
+                    info.name(), emptyArguments, "SCALAR", rowInputSchemaBytes, currentSettingsBytes(client),
+                    null, null, null, false, null, null, null, null, schemaName);
+            byte[][] attachHandleUsed = new byte[1][];
+            BindResponse[] boundHolder = new BindResponse[1];
+            byte[] opaqueData = client.withConnection(a -> {
+                attachHandleUsed[0] = a.handle();
+                BindResponse bound = a.service().bind(withAttachHandle(bindRequest, a.handle()), null);
+                boundHolder[0] = bound;
+                return bound.opaque_data();
+            });
+            byte[] bindCallBytes = RecordCodec.serializeToBytes(withAttachHandle(bindRequest, attachHandleUsed[0]));
+            // InitRequest.output_schema is the RESULT batch's schema (one "result"
+            // column of the return type) — BindResponse.output_schema(), NOT this
+            // function's own input schema.
+            byte[] outputSchemaBytes = boundHolder[0].output_schema();
+            DataType returnType = resolveReturnType(outputSchemaBytes);
+            return VgiScalarFunction.eager(config, info.name(), bindCallBytes, outputSchemaBytes, opaqueData,
+                    rowInputSchemaBytes, resolvedInputTypes, rowArgIndices, returnType, deterministic);
+        }
+
+        // At least one vgi_const argument: its VALUE (not just type) is only
+        // known once a real row exists — Spark's bind(StructType) sees types
+        // only. Defer the real bind() entirely to the first produceResult()
+        // call, per call site, and rebind whenever the observed const value
+        // actually changes — see VgiScalarFunction's own javadoc for the
+        // full rationale (mirrors vgi-trino's BindCache, simplified since
+        // Spark already scopes one VgiScalarFunction instance to one call
+        // site, unlike Trino's shared-across-Drivers cache).
+        DataType returnType = resolveStaticReturnType(context);
+        return VgiScalarFunction.lazyConst(config, schemaName, info.name(), resolvedInputTypes, resolvedFieldsArray,
+                rowArgIndices, constArgIndices, rowInputSchemaBytes, returnType, deterministic);
     }
 
     /**
@@ -207,6 +229,50 @@ final class VgiUnboundScalarFunction implements UnboundFunction {
     }
 
     /**
+     * Resolve {@code resultType()} from the STATIC discovery-time output
+     * schema — {@code FunctionInfo.output_schema()}, no RPC — used only for
+     * a function with at least one {@code vgi_const} argument, where the
+     * real {@code bind()} RPC (and hence a real, call-site-specific output
+     * schema) is deferred to the first {@code produceResult()} call (see
+     * {@link #bind}). Spark commits to a call site's {@code resultType()}
+     * at ANALYSIS time, before any row — including any const argument's
+     * actual value — is ever seen, so a return type that itself depends on
+     * a const argument's VALUE (as opposed to depending on argument TYPES,
+     * which {@link #resolveReturnType} already handles from a real bind())
+     * is a genuine, documented v1 ceiling: refused here exactly like an
+     * argument-type-dependent dynamic return is refused in {@link
+     * #resolveReturnType}.
+     */
+    private DataType resolveStaticReturnType(String context) {
+        Schema outSchema = ArrowSchemaCodec.deserializeSchema(info.output_schema());
+        if (outSchema == null || outSchema.getFields().size() != 1) {
+            throw new UnsupportedOperationException(context + ": expected exactly one output column, got "
+                    + (outSchema == null ? "none" : outSchema.getFields().size()));
+        }
+        Field outField = outSchema.getFields().get(0);
+        Map<String, String> outMd = outField.getMetadata();
+        boolean stillDynamic = (outMd != null && "true".equals(outMd.get("vgi:any")))
+                || outField.getType().getTypeID() == org.apache.arrow.vector.types.pojo.ArrowType.ArrowTypeID.Null;
+        if (stillDynamic) {
+            throw new UnsupportedOperationException(context + ": has a vgi_const argument AND an on_bind-dynamic "
+                    + "return type — the return type would need this call site's real const VALUE (not just its "
+                    + "type) to resolve, but Spark commits to resultType() before any row is ever seen — not "
+                    + "supported");
+        }
+        DataType returnType;
+        try {
+            returnType = farm.query.vgispark.types.VgiTypeMapping.toSparkType(outField);
+        } catch (UnsupportedOperationException e) {
+            throw new UnsupportedOperationException(context + ": return type: " + e.getMessage(), e);
+        }
+        if (!VgiScalarValueBridge.isSupported(returnType)) {
+            throw new UnsupportedOperationException(context + ": return type " + returnType
+                    + " is not bridged yet (struct/list/map returns are a later phase)");
+        }
+        return returnType;
+    }
+
+    /**
      * Encode {@code BindRequest.settings} from whatever of the worker's own
      * declared settings ({@link VgiWorkerClient#declaredSettings()}, from
      * {@code CatalogAttachResult.settings}) the current Spark session
@@ -230,7 +296,18 @@ final class VgiUnboundScalarFunction implements UnboundFunction {
      *         for every setting, exactly as if this feature didn't exist)
      */
     private static byte[] currentSettingsBytes(VgiWorkerClient client) {
-        Map<String, SettingSpec> declared = client.declaredSettings();
+        return currentSettingsBytes(client.declaredSettings());
+    }
+
+    /**
+     * Package-private overload also used by {@link VgiScalarFunction}'s
+     * lazy const-argument bind path, which has only an executor-side
+     * unpooled {@code Attached} connection (its {@code
+     * CatalogAttachResult.settings()}, decoded the same way) — not the
+     * driver's pooled {@link VgiWorkerClient} instance {@link
+     * VgiWorkerClient#declaredSettings()} itself caches on.
+     */
+    static byte[] currentSettingsBytes(Map<String, SettingSpec> declared) {
         if (declared.isEmpty()) return null;
 
         SparkSession spark = SparkSession.active();
@@ -282,15 +359,17 @@ final class VgiUnboundScalarFunction implements UnboundFunction {
      * {@code loadFunction} path) gets an actionable error rather than a
      * generic "function not found".
      *
-     * <p>v1 supports only: every argument positional, non-const, non-vararg,
-     * with a concrete type {@link VgiScalarValueBridge} can bridge; and
-     * exactly one output column (the STRUCTURAL shape every VGI scalar
-     * function has, checked here). An argument's actual TYPE — including an
-     * {@code any}-typed one — is resolved later, from the real {@code bind()}
-     * call, not here (see {@link #bind}, {@link #resolveReturnType}, and this
+     * <p>v1 supports only: every argument positional, non-vararg, with a
+     * concrete type {@link VgiScalarValueBridge} can bridge; and exactly one
+     * output column (the STRUCTURAL shape every VGI scalar function has,
+     * checked here). An argument's actual TYPE — including an {@code
+     * any}-typed one — is resolved later, from the real {@code bind()} call,
+     * not here (see {@link #bind}, {@link #resolveReturnType}, and this
      * class's own javadoc); at discovery time an {@code any}-typed argument's
      * static Arrow field is simply skipped rather than type-checked, since it
-     * carries no real type yet to check.
+     * carries no real type yet to check. A {@code vgi_const} argument's VALUE
+     * is resolved later still, lazily per row — see {@link #bind} and {@link
+     * VgiScalarFunction}'s own javadoc.
      */
     static VgiUnboundScalarFunction tryBuild(
             VgiWorkerClient client, VgiCatalogConfig config, String schemaName, FunctionInfo info) {
@@ -299,6 +378,7 @@ final class VgiUnboundScalarFunction implements UnboundFunction {
         List<Field> argFields = argsSchema == null ? List.of() : argsSchema.getFields();
         DataType[] inputTypes = new DataType[argFields.size()];
         boolean[] anyArgs = new boolean[argFields.size()];
+        boolean[] constArgs = new boolean[argFields.size()];
         for (int i = 0; i < argFields.size(); i++) {
             Field field = argFields.get(i);
             java.util.Map<String, String> md = field.getMetadata();
@@ -312,8 +392,10 @@ final class VgiUnboundScalarFunction implements UnboundFunction {
                         + "' is a named argument — only positional arguments are supported yet");
             }
             if (md != null && "true".equals(md.get("vgi_const"))) {
-                throw new UnsupportedOperationException(context + ": argument '" + field.getName()
-                        + "' is a bind-time constant (vgi_const) — not supported yet");
+                // Value (not just type) resolved later, per call, from the
+                // real InternalRow — see bind()/VgiScalarFunction's own
+                // lazy-bind-cache javadoc.
+                constArgs[i] = true;
             }
             if (md != null && "true".equals(md.get("vgi_varargs"))) {
                 throw new UnsupportedOperationException(context + ": argument '" + field.getName()
@@ -359,6 +441,6 @@ final class VgiUnboundScalarFunction implements UnboundFunction {
 
         return new VgiUnboundScalarFunction(
                 client, config, schemaName, info, argsSchema == null ? new Schema(List.of()) : argsSchema,
-                inputTypes, anyArgs, deterministic);
+                inputTypes, anyArgs, constArgs, deterministic);
     }
 }

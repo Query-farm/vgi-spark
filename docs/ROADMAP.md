@@ -413,7 +413,7 @@ test-harness fix, not a production one, but a real correctness bug nonetheless.
 ---
 
 ### 7. Scalar function scope expansion
-**Status:** 🟡 In progress — 7b landed (partial payoff, see below); 7a/7c/7d/7e not started
+**Status:** 🟡 In progress — 7b and 7c landed (see below); 7a/7d/7e not started
 
 Each of these lifts one specific restriction from `VgiUnboundScalarFunction`'s v1 validation. Pick
 off independently as needed — don't do all at once.
@@ -449,13 +449,34 @@ off independently as needed — don't do all at once.
   `"double"`), so every `typeof()`-based record anywhere in the corpus already mismatches on
   casing/naming regardless of this item; worth its own follow-up (a small string-normalization
   table in the runner) rather than folding into 7b.
-- **7c. Const (bind-time-constant) scalar arguments.** A `vgi_const` argument's *value* needs to be
-  read from the call site's literal at `bind()` time (Spark's `UnboundFunction.bind(StructType)`
-  only sees types, not values — same limitation `vgi-trino`'s `BindCache` worked around, see its
-  own javadoc) — likely needs Spark's magic-method/codegen path or falling back to re-binding
-  inside `produceResult` the first time a const value is observed (accepting "no caching benefit if
-  it varies," same honest tradeoff vgi-trino documents). Unlocks `scalar/conditional_message.test`,
-  contributes to `binary_packet.test`, `overload/scalar_overload.test` (const-count/const-type
+- **7c. Const (bind-time-constant) scalar arguments.** ✅ Done. `VgiUnboundScalarFunction.tryBuild`
+  no longer refuses a `vgi_const` argument; `bind(StructType)` now branches on whether the function
+  has one. With none, behavior is unchanged (eager, driver-side bind, replayed at every `init()`).
+  With at least one, `bind()` does NO RPC at all — Spark sees only the const argument's TYPE at
+  this point, never its VALUE, exactly the limitation `vgi-trino`'s `VgiScalarFunctions.BindCache`
+  exists to work around (see its own javadoc) — and instead builds a `VgiScalarFunction` that binds
+  lazily, inside `produceResult`, the first time (and again whenever it changes) a real `InternalRow`
+  reveals the observed const value(s): a single-slot, per-call-site cache (simpler than vgi-trino's
+  shared LRU across Drivers, since Spark already scopes one `VgiScalarFunction` instance to one call
+  site) — a genuinely per-row-VARYING "constant" degrades to "no caching benefit, one bind() RPC per
+  row," never wrong results, the same honest tradeoff vgi-trino documents. The return type for a
+  const-bearing function is resolved from the STATIC discovery-time `FunctionInfo.output_schema()`
+  (no RPC, since Spark commits to `resultType()` before any row — including any const value — is
+  ever seen) via a new `resolveStaticReturnType`; a function combining a const argument with an
+  `on_bind`-DYNAMIC return (i.e. the return type would need the const VALUE, not just types, to
+  resolve) is refused with a clear message — a genuine, documented v1 ceiling, not a scope choice
+  (no live fixture currently combines the two). New `VgiScalarValueBridge.readPlainValue` bridges an
+  `InternalRow` column to the plain Java value shape `ScalarValue.of(ArrowType, Object)` needs.
+  **Also found and fixed, while adding a curated conformance test for this item**: both
+  `SqlLogicTestRunner` and `VgiSqlLogicTestSweepTest` (which duplicates the same replay loop) were
+  missing DuckDB sqllogictest's `"(empty)"` convention for an empty-string expected cell — every
+  actual empty-string result compared as `""` against the literal token `"(empty)"` and mismatched;
+  first surfaced by `conditional_message.test` (a false condition returns `""`), but this was a
+  corpus-wide runner gap, not specific to this function — fixed in both places, kept in sync.
+  Unlocks `scalar/conditional_message.test` as a curated conformance test (19/24 records; non-
+  portable: `ATTACH`/`DETACH`, two `unnest(generate_series(...))` records, and one `typeof(...)`
+  record — the same pre-existing DuckDB→Spark type-name-casing gap noted under 7b, not fixed here).
+  Contributes to `binary_packet.test` (7a), `overload/scalar_overload.test` (const-count/const-type
   dispatch, tier 2 item 9).
 - **7d. Vararg scalar functions.** `UnboundFunction.bind(StructType)` receives the CALL SITE's
   actual arity — nothing stops recognizing "this is more args than the declared fixed signature,
@@ -912,3 +933,12 @@ process. Worth adding to `VgiSqlLogicTestSweepTest`'s eligibility gate alongside
   `typeof()` string normalization (`"DOUBLE"` vs `"double"`) — noted under item 7b, not fixed here.
   Full `./gradlew :connector:test` green (50/50). Sweep: 574 → 624 passing records, 17 → 19 files
   fully passing.
+- **2026-08-26** — Tier 2 item 7c (const/`vgi_const` scalar arguments) done. `bind(StructType)` now
+  branches: no const args, unchanged eager driver-side bind; at least one, defers the real `bind()`
+  entirely to the first `produceResult()` call, keyed on the actual observed const value(s) (a
+  single-slot per-call-site cache, rebinding only when the observed value changes). Also found and
+  fixed, incidentally: both `SqlLogicTestRunner` and `VgiSqlLogicTestSweepTest` were missing DuckDB's
+  `"(empty)"` empty-string-cell convention — a corpus-wide runner gap, not specific to this item,
+  fixed in both (they duplicate the same replay loop). Full `./gradlew :connector:test` green
+  (53/53). Sweep: 624 → 659 passing records, still 19 files fully passing (`conditional_message.test`
+  added as a curated test, 19/24 records — the other 5 are pre-existing, unrelated, documented gaps).
