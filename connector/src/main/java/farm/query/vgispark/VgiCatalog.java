@@ -10,7 +10,10 @@ import farm.query.vgi.protocol.TableInfo;
 import farm.query.vgi.protocol.TableScanFunctionGetResponse;
 import farm.query.vgirpc.MethodNotImplementedError;
 import farm.query.vgirpc.marshal.RecordCodec;
+import farm.query.vgispark.branch.FormatOptionsDecoder;
 import farm.query.vgispark.branch.ScanBranchesDecoder;
+import farm.query.vgispark.branch.VgiBranch;
+import farm.query.vgispark.branch.VgiFormatScanBranch;
 import farm.query.vgispark.branch.VgiScanBranch;
 import farm.query.vgispark.client.VgiWorkerClient;
 import farm.query.vgispark.function.VgiAggregateFunctions;
@@ -218,7 +221,7 @@ public final class VgiCatalog implements TableCatalog, SupportsNamespaces, Funct
             throw new NoSuchTableException(ident);
         }
         TableInfo info = TableInfoDecoder.decode(tableResp.items().get(0));
-        List<VgiScanBranch> branches = resolveBranches(schemaName, tableName, atUnit, atValue);
+        List<VgiBranch> branches = resolveBranches(schemaName, tableName, atUnit, atValue);
 
         return new VgiTable(info.schema_name(), info.name(), branches,
                 info.columns(), info.cardinality_estimate(), atUnit, atValue, info.required_filters(),
@@ -234,12 +237,13 @@ public final class VgiCatalog implements TableCatalog, SupportsNamespaces, Funct
      *
      * <p>Refuses (fail closed, loudly — see {@link VgiScanBranch}'s own
      * javadoc) rather than silently dropping or mis-scanning: a catalog-table
-     * or format branch (not yet supported — {@code docs/ROADMAP.md} tracks
-     * both as follow-up work), or any branch declaring a non-empty {@code
-     * branch_filter} (translating VGI's branch-filter grammar into a
-     * per-branch pushdown isn't wired up yet).
+     * branch (not yet supported — {@code docs/ROADMAP.md} tracks it as
+     * follow-up work), a format branch whose {@code format_name} isn't {@code
+     * "csv"} (parquet/delta/iceberg — item 11's own scope note), or any
+     * branch declaring a non-empty {@code branch_filter} (translating VGI's
+     * branch-filter grammar into a per-branch pushdown isn't wired up yet).
      */
-    private List<VgiScanBranch> resolveBranches(String schemaName, String tableName, String atUnit, String atValue) {
+    private List<VgiBranch> resolveBranches(String schemaName, String tableName, String atUnit, String atValue) {
         byte[] branchesResponse;
         try {
             branchesResponse = client.withConnection(a ->
@@ -254,15 +258,9 @@ public final class VgiCatalog implements TableCatalog, SupportsNamespaces, Funct
         }
 
         ScanBranchesDecoder.Result decoded = ScanBranchesDecoder.decode(branchesResponse);
-        List<VgiScanBranch> branches = new ArrayList<>(decoded.branches().size());
+        List<VgiBranch> branches = new ArrayList<>(decoded.branches().size());
         for (int i = 0; i < decoded.branches().size(); i++) {
             ScanBranchesDecoder.DecodedBranch branch = decoded.branches().get(i);
-            if (branch.kind() != ScanBranchesDecoder.DecodedBranch.Kind.FUNCTION) {
-                throw new UnsupportedOperationException("table '" + schemaName + "." + tableName
-                        + "': branch " + i + " is a " + branch.kind()
-                        + " branch, which vgi-spark doesn't support scanning yet (see docs/ROADMAP.md,"
-                        + " \"Multi-branch: format branches\") — only function branches are supported");
-            }
             if (branch.branchFilter() != null && !branch.branchFilter().isBlank()) {
                 throw new UnsupportedOperationException("table '" + schemaName + "." + tableName
                         + "': branch " + i + " (" + branch.functionName() + ") declares branch_filter '"
@@ -270,8 +268,27 @@ public final class VgiCatalog implements TableCatalog, SupportsNamespaces, Funct
                         + " (see docs/ROADMAP.md, the branch_filter note under \"Multi-branch: format"
                         + " branches\") — refusing rather than silently scanning unfiltered");
             }
-            byte[] bindArguments = ScanFunctionArguments.toBindArguments(branch.arguments());
-            branches.add(new VgiScanBranch(branch.functionName(), bindArguments));
+            switch (branch.kind()) {
+                case FUNCTION -> {
+                    byte[] bindArguments = ScanFunctionArguments.toBindArguments(branch.arguments());
+                    branches.add(new VgiScanBranch(branch.functionName(), bindArguments));
+                }
+                case FORMAT -> {
+                    if (!"csv".equalsIgnoreCase(branch.formatName())) {
+                        throw new UnsupportedOperationException("table '" + schemaName + "." + tableName
+                                + "': branch " + i + " is a FORMAT branch of format '" + branch.formatName()
+                                + "', which vgi-spark only reads for \"csv\" (see docs/ROADMAP.md,"
+                                + " \"Multi-branch: format branches\")");
+                    }
+                    Map<String, Object> options = FormatOptionsDecoder.decode(branch.formatOptions());
+                    List<String> locations = branch.formatLocations() == null ? List.of() : branch.formatLocations();
+                    branches.add(new VgiFormatScanBranch(branch.formatName(), locations, options));
+                }
+                case CATALOG_TABLE -> throw new UnsupportedOperationException("table '" + schemaName + "."
+                        + tableName + "': branch " + i + " is a CATALOG_TABLE branch, which vgi-spark doesn't"
+                        + " support scanning yet (see docs/ROADMAP.md, \"Multi-branch: format branches\")"
+                        + " — only function and csv-format branches are supported");
+            }
         }
         if (branches.isEmpty()) {
             // The table itself was already confirmed to exist (via

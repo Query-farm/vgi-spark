@@ -67,6 +67,9 @@ public final class VgiPartitionReaderFactory implements PartitionReaderFactory {
 
     @Override
     public PartitionReader<ColumnarBatch> createColumnarReader(InputPartition partition) {
+        if (partition instanceof VgiFormatInputPartition formatPartition) {
+            return new VgiCsvPartitionReader(formatPartition, tableOutputSchemaBytes, projectionIds);
+        }
         return new VgiPartitionReader(config, (VgiInputPartition) partition, tableOutputSchemaBytes,
                 projectionIds, pushdownFiltersBytes, rowLimit);
     }

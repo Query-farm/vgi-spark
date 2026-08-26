@@ -11,6 +11,8 @@ import farm.query.vgi.protocol.TableFunctionPlanRequest;
 import farm.query.vgirpc.marshal.RecordCodec;
 import farm.query.vgispark.VgiCatalogConfig;
 import farm.query.vgispark.VgiTable;
+import farm.query.vgispark.branch.VgiBranch;
+import farm.query.vgispark.branch.VgiFormatScanBranch;
 import farm.query.vgispark.branch.VgiScanBranch;
 import farm.query.vgispark.client.VgiWorkerClient;
 import org.apache.arrow.vector.types.pojo.ArrowType;
@@ -274,10 +276,28 @@ public final class VgiScan implements Scan, Batch, SupportsReportStatistics {
         // downstream (VgiPartitionReaderFactory/VgiPartitionReader) needs to
         // know which branch a partition came from.
         List<InputPartition> partitions = new ArrayList<>();
-        for (VgiScanBranch branch : table.branches()) {
-            partitions.addAll(planBranchPartitions(branch));
+        for (VgiBranch branch : table.branches()) {
+            switch (branch) {
+                case VgiScanBranch fn -> partitions.addAll(planBranchPartitions(fn));
+                case VgiFormatScanBranch fmt -> partitions.addAll(planFormatBranchPartitions(fmt));
+            }
         }
         return partitions.toArray(new InputPartition[0]);
+    }
+
+    /**
+     * One {@link VgiFormatInputPartition} per location — no VGI RPC at all;
+     * {@code branch.locations()} is already resolved (from {@code
+     * catalog_table_scan_branches_get}'s response), so this is purely local
+     * bookkeeping, unlike {@link #planBranchPartitions} which must bind and
+     * plan against the worker.
+     */
+    private List<InputPartition> planFormatBranchPartitions(VgiFormatScanBranch branch) {
+        List<InputPartition> partitions = new ArrayList<>(branch.locations().size());
+        for (String location : branch.locations()) {
+            partitions.add(new VgiFormatInputPartition(branch.formatName(), location, branch.formatOptions()));
+        }
+        return partitions;
     }
 
     private List<InputPartition> planBranchPartitions(VgiScanBranch branch) {

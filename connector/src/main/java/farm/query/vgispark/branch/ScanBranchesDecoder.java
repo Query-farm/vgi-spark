@@ -109,7 +109,15 @@ public final class ScanBranchesDecoder {
                 bytes(row, "format_options"));
     }
 
-    private static Map<String, Object> readOneRow(byte[] bytes) {
+    /**
+     * Package-visible: also reused by {@link FormatOptionsDecoder} to decode
+     * a FORMAT branch's {@code format_options} bytes, which use this exact
+     * same "1-row Arrow IPC batch, column names carry the keys" wire shape
+     * (confirmed against the Python worker's own {@code
+     * _serialize_named_scalars}) — not worth a second, duplicated IPC-row
+     * reader for what is structurally the identical decode.
+     */
+    static Map<String, Object> readOneRow(byte[] bytes) {
         if (bytes == null || bytes.length == 0) {
             throw new IllegalStateException("ScanBranchesDecoder: empty item bytes");
         }

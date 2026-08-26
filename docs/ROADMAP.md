@@ -657,17 +657,52 @@ the two different routes above). Plus a live regression test
 ---
 
 ### 11. Multi-branch: format branches
-**Status:** ⬜ Not started (split out from item 1 — do function + catalog-table branches first)
+**Status:** ✅ Done — CSV format branches only (see scope note below)
 
-Once item 1's function/catalog-table branch plumbing exists, format branches
-(`ScanBranch.format`/`locations`/`format_options` — parquet/csv/delta/iceberg descriptors, P4 from
-the original protocol design study) are the natural extension: map `format="parquet"` to Spark's
-own `spark.read.format("parquet")`/`DataSourceV2` file-source machinery per-branch, refuse
-(name the branch, don't silently drop rows) for any format we don't recognize.
+**What shipped:** `VgiBranch` is now a sealed interface (`VgiScanBranch` for function branches,
+new `VgiFormatScanBranch` for format branches — `format_name`/`locations`/`format_options`,
+decoded from their 1-row-IPC-batch wire form by a new `FormatOptionsDecoder`, reusing
+`ScanBranchesDecoder`'s own IPC-row reader since the shape is identical). `VgiCatalog
+.resolveBranches` no longer refuses a FORMAT branch outright — only one whose `format_name` isn't
+`"csv"` (parquet/delta/iceberg refused with a clear message, matching the deliberately narrow v1
+scope below). `VgiScan.planInputPartitions` plans one new `VgiFormatInputPartition` per location
+(no VGI RPC at all — `format_locations` is already resolved from the branches response), read by a
+new `VgiCsvPartitionReader` that opens the file directly and parses it into the SAME `ColumnarBatch`
+shape every other partition produces, so it unions transparently with any function-branch
+partitions of the same scan.
 
-**Unlocks:** contributes to `catalog/multi_branch_format.test`, `multi_branch_heterogeneous.test`
-(both also need `VGI_TEST_BRANCH_DIR`), `table/required_filters_native.test` (also needs it, plus
-struct-subfield pushdown, item 3).
+**Deliberately narrow v1 scope, stated up front rather than discovered as a gap:** genuinely
+delegating to Spark's OWN file-source machinery (`spark.read.format(...)`) turns out not to fit
+this connector's `Table`/`Scan`/`Batch`/`PartitionReader` model at all — a `PartitionReader` runs
+on an EXECUTOR with no `SparkSession` available (`spark.read` is a driver-only construct), and
+Spark's V2 API has no "this table's read is a union of two different Scans" hook to combine a VGI
+scan with a native Spark DataFrame at the logical-plan level either. So this reads files DIRECTLY,
+inside the existing `PartitionReader` framework, entirely independent of Spark's built-in readers —
+architecturally cleaner, but only for formats worth hand-implementing. Only `"csv"` is
+implemented, and only as a delimiter-plus-optional-header SPLIT (`VgiCsvPartitionReader`'s own
+javadoc) — NOT a full RFC 4180 parser (no quoting, no embedded delimiters/newlines in a field, no
+escaping) — recognizing exactly the three `format_options` keys the real fixture uses (`delim`,
+`header`, `nullstr`), bridging the same primitive scalar types `VgiScalarValueBridge` does. Only
+local filesystem paths / `file://` URIs are supported (no S3/HTTP). Parquet/delta/iceberg format
+branches are refused, not attempted — a real follow-up, not a silent gap.
+
+**Unlocks:** the underlying CAPABILITY, verified live end to end against the real fixture's
+`data.multi_branch_format` table and its actual `delim`/`header`/`nullstr` options
+(`VgiCatalogQueryTest.scanReadsAFormatBranchCsvFileWithOptions`) — but NOT `catalog
+/multi_branch_format.test` itself as a curated replay: its setup uses DuckDB-only `COPY ... TO
+(FORMAT 'csv', ...)` (Spark has no equivalent statement) and one assertion uses `vgi_table_branches()`
+(DuckDB-only introspection), so the live test pre-creates the CSV file directly instead, matching the
+same content and options, and checks the same result the real file asserts (the `nullstr`-driven
+`row_2` NULL). `multi_branch_heterogeneous.test`/`multi_branch_iceberg.test` remain out of reach
+(parquet/iceberg format branches, out of this item's v1 scope). `table/required_filters_native.test`
+also needs struct-subfield pushdown (item 3, already done) but wasn't independently re-verified here.
+
+**Verification:** `connector/src/main/java/farm/query/vgispark/branch/` (`VgiBranch`,
+`VgiFormatScanBranch`, `FormatOptionsDecoder`); `connector/.../scan/` (`VgiFormatInputPartition`,
+`VgiCsvPartitionReader`); `VgiCatalog.resolveBranches`, `VgiScan.planFormatBranchPartitions`,
+`VgiPartitionReaderFactory.createColumnarReader`. Test:
+`VgiCatalogQueryTest.scanReadsAFormatBranchCsvFileWithOptions` (live, real fixture worker + a
+directly pre-created CSV file).
 
 ---
 
@@ -1006,3 +1041,14 @@ process. Worth adding to `VgiSqlLogicTestSweepTest`'s eligibility gate alongside
   found live via the sweep, not pursued further (a genuinely bigger scope than this item's otherwise
   full fixed-argument coverage). Full `./gradlew :connector:test` green (59/59). Sweep: 715 → 725
   passing records.
+- **2026-08-26** — Tier 2 item 11 (multi-branch format branches) done — CSV only. `VgiBranch` sealed
+  interface (`VgiScanBranch` / new `VgiFormatScanBranch`); a new `VgiCsvPartitionReader` reads a
+  format branch's file(s) directly, inside the existing `PartitionReader` framework (delegating to
+  Spark's own `spark.read.format(...)` turns out not to fit this connector's `Scan`/`Batch` model at
+  all — a `PartitionReader` runs executor-side with no `SparkSession` available). Deliberately
+  narrow, stated scope: a delimiter-plus-optional-header split (not full RFC 4180 CSV), local
+  filesystem paths only, parquet/delta/iceberg refused rather than attempted. Verified live against
+  the real fixture's `data.multi_branch_format` table and its actual `delim`/`header`/`nullstr`
+  options — not as a curated `.test` replay, since that file's own setup uses DuckDB-only `COPY ...
+  TO`/`vgi_table_branches()` syntax Spark can't execute regardless. Full `./gradlew :connector:test`
+  green (60/60).

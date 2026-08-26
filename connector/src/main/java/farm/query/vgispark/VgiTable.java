@@ -2,7 +2,7 @@
 
 package farm.query.vgispark;
 
-import farm.query.vgispark.branch.VgiScanBranch;
+import farm.query.vgispark.branch.VgiBranch;
 import farm.query.vgispark.client.VgiWorkerClient;
 import farm.query.vgispark.scan.VgiScanBuilder;
 import farm.query.vgispark.types.ArrowSchemaCodec;
@@ -35,8 +35,8 @@ import java.util.Set;
  *        {@code catalog_table_scan_function_get}) resolves to a one-element
  *        list; a genuinely multi-branch table (via {@code
  *        catalog_table_scan_branches_get}) resolves to one entry per
- *        function branch. See {@link VgiScanBranch}'s own javadoc for what's
- *        refused rather than silently dropped
+ *        function or format branch. See {@link VgiBranch}'s own javadoc for
+ *        what's refused rather than silently dropped
  * @param outputSchemaBytes the table's full (unprojected) Arrow schema, IPC-encoded —
  *        shared by every branch; VGI's multi-branch model requires every
  *        branch to conform to the same declared output schema
@@ -61,7 +61,7 @@ import java.util.Set;
 public record VgiTable(
         String schemaName,
         String tableName,
-        List<VgiScanBranch> branches,
+        List<VgiBranch> branches,
         byte[] outputSchemaBytes,
         Long cardinalityEstimate,
         String atUnit,

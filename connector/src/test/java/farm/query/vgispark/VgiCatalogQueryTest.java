@@ -658,4 +658,44 @@ class VgiCatalogQueryTest {
         assertEquals("varchar", spark.sql("SELECT " + CATALOG + ".type_info('hello') AS r")
                 .collectAsList().get(0).getString(0));
     }
+
+    @Test
+    @Timeout(60)
+    void scanReadsAFormatBranchCsvFileWithOptions() throws Exception {
+        // data.multi_branch_format — roadmap tier 2 item 11: a FORMAT branch
+        // (format_name="csv", format_locations=[...], format_options={delim,
+        // header, nullstr}) read directly by VgiCsvPartitionReader, no VGI
+        // RPC involved for the actual row data. The fixture worker's own
+        // scan-branches handler names this exact file, at $VGI_TEST_BRANCH_DIR
+        // (or, absent that env var — as here — the system temp dir, which the
+        // worker computes with Python's tempfile.gettempdir()) — pre-create it
+        // here to exercise the REAL fixture code path end to end, matching
+        // scalar/catalog/multi_branch_format.test's own assertions (that .test
+        // file itself can't be replayed — its setup uses DuckDB-only COPY TO
+        // and its one extra assertion uses vgi_table_branches() — see
+        // docs/ROADMAP.md item 11's own note).
+        String branchDir = System.getProperty("java.io.tmpdir");
+        if (branchDir.endsWith("/")) branchDir = branchDir.substring(0, branchDir.length() - 1);
+        java.nio.file.Path csvPath = java.nio.file.Path.of(branchDir, "vgi_format_branch.csv");
+        String csv = "n|label\n0|row_0\n1|row_1\n2|row_2\n3|row_3\n4|row_4\n";
+        java.nio.file.Files.writeString(csvPath, csv);
+        try {
+            List<Row> rows = spark.sql("SELECT n, label FROM " + CATALOG + ".data.multi_branch_format ORDER BY n")
+                    .collectAsList();
+            assertEquals(5, rows.size());
+            for (int i = 0; i < 5; i++) {
+                assertEquals((long) i, rows.get(i).getLong(0));
+                if (i == 2) {
+                    // nullstr="row_2" — the one label the format_options must
+                    // have actually arrived for this to be NULL rather than
+                    // the literal string "row_2".
+                    assertTrue(rows.get(i).isNullAt(1));
+                } else {
+                    assertEquals("row_" + i, rows.get(i).getString(1));
+                }
+            }
+        } finally {
+            java.nio.file.Files.deleteIfExists(csvPath);
+        }
+    }
 }

@@ -28,5 +28,5 @@ package farm.query.vgispark.branch;
  *        re-encoded as {@code BindRequest.arguments} bytes (see {@code
  *        farm.query.vgi.client.ScanFunctionArguments#toBindArguments})
  */
-public record VgiScanBranch(String functionName, byte[] scanFunctionArguments) {
+public record VgiScanBranch(String functionName, byte[] scanFunctionArguments) implements VgiBranch {
 }
