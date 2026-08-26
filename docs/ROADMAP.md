@@ -413,17 +413,32 @@ test-harness fix, not a production one, but a real correctness bug nonetheless.
 ---
 
 ### 7. Scalar function scope expansion
-**Status:** 🟡 In progress — 7b, 7c, 7d landed (see below); 7a/7e not started
+**Status:** ✅ Done — all five sub-items (7a–7e) landed
 
-Each of these lifts one specific restriction from `VgiUnboundScalarFunction`'s v1 validation. Pick
-off independently as needed — don't do all at once.
+Each of these lifts one specific restriction from `VgiUnboundScalarFunction`'s v1 validation.
 
-- **7a. Struct/list scalar args and returns.** Extends `VgiScalarValueBridge` (currently only
-  primitive scalars) to read/write nested Arrow struct/list vectors — real new value-bridging code,
-  the same shape of work `VgiTypeMapping`'s table-read path never needed because `ArrowColumnVector`
-  handles nesting generically; scalar functions have no such generic wrapper since each argument/
-  return is one cell, not a batch. Unlocks `scalar/geo_centroid.test`, `geo_distance.test`,
-  `binary_packet.test` (also const, see 7c) — **~3 files** (2 also need varargs, 7d).
+- **7a. Struct/list scalar args and returns.** ✅ Done. `VgiScalarValueBridge` reads/writes nested
+  Arrow `StructVector`/`ListVector`/`FixedSizeListVector` cells, recursively, to arbitrary depth —
+  real new value-bridging code, the same shape of work `VgiTypeMapping`'s table-read path never
+  needed because `ArrowColumnVector` handles nesting generically; scalar functions have no such
+  generic wrapper since each argument/return is one cell, not a batch. The write path recurses
+  through a new `writeValue` core (extracted from `writeAt`, which now delegates to it via Spark's
+  own generic `InternalRow.get(ordinal, dataType)` rather than a per-type direct getter — a
+  behavior-preserving internal refactor, verified by the full existing suite staying green
+  unchanged); the read path builds `GenericInternalRow`/`GenericArrayData` for a struct/list result,
+  matching what `InternalRow` accessors elsewhere in the engine expect back. `VgiTypeMapping
+  .toArrowField` (the Spark→Arrow reverse mapper 7b introduced) now recurses through
+  `StructType`/`ArrayType` too, needed for an `any`-typed or vararg-expanded struct/list argument —
+  confirmed live necessary by `geo_centroid_struct`'s vararg-of-structs shape. `readPlainValue`
+  (const-argument values) gained a matching struct→`Map`/list→`List` plain-value conversion, needed
+  for `binary_packet`'s const struct argument. A `map`-typed argument/return remains out of scope
+  (no real fixture needs one). **Zero curated-conformance-test payoff, confirmed not assumed**: the
+  three target files (`geo_centroid.test`, `geo_distance.test`, `binary_packet.test`) exclusively use
+  DuckDB's own `{...}::STRUCT(...)`/`[...]::TYPE[n]` struct/array LITERAL syntax, which Spark's SQL
+  parser cannot parse at all (confirmed via the general sweep: 0/12, 0/9, 0/15 respectively) — a SQL
+  dialect gap the connector itself can't paper over, same category as several earlier items' findings.
+  Verified instead with 5 new live `VgiCatalogQueryTest` regressions against the real fixture
+  functions, using Spark's own `named_struct(...)`/`array(...)` literal syntax for equivalent values.
 - **7b. Decimal scalar types + any-typed args/returns.** ✅ Done. `VgiScalarValueBridge` now
   reads/writes `DecimalVector` (`Decimal.apply(BigDecimal, precision, scale)` round-trip).
   `VgiUnboundScalarFunction` no longer resolves a scalar function's return type — or an
@@ -498,8 +513,19 @@ off independently as needed — don't do all at once.
   `unnest(generate_series(...))`, and every record referencing the three tables that file's own
   skipped `CREATE TABLE ... unnest(generate_series(...))` would have populated). Contributes to
   `geo_centroid`/`geo_distance` (7a) and `overload/scalar_varargs_overload.test` (tier 2 item 9).
-- **7e. Nested/complex return types** (e.g. `list<struct<...>>`). Same value-bridging work as 7a,
-  return-side. Unlocks `scalar/unnest_tensor.test` — **1 file**, likely low priority (niche shape).
+- **7e. Nested/complex return types** (e.g. `list<struct<...>>`). ✅ Done — turned out to already be
+  fully covered by 7a's recursive value-bridging, confirmed live rather than assumed against the
+  hardest real shape in the corpus: `main.unnest_tensor`'s ONE argument is `any`-typed at the WHOLE
+  -STRUCT level (`struct<tensor: list<any-nesting-depth>, axes: struct<...variable field count/
+  names...>>`), and its RETURN type is itself dynamically computed by `on_bind` FROM that argument's
+  actual shape (`list<struct<value, axes: struct<...same variable fields...>>>`) — exercising the
+  `any`-argument (7b), dynamic-return (7b), and recursive struct/list (7a) resolution paths
+  simultaneously, on a nested list-of-structs RETURN no other live test reaches. Verified with a new
+  live `VgiCatalogQueryTest` regression (`scalarFunctionReturnsAListOfDynamicallyShapedStructs`) — no
+  additional production code was needed. **Zero curated-conformance-test payoff, confirmed**:
+  `scalar/unnest_tensor.test` uses the same DuckDB-only struct/array literal syntax as 7a's target
+  files, PLUS a `FROM UNNEST(...)` table-valued-expression syntax Spark's parser also doesn't support
+  — every record is unparseable regardless of connector capability.
 
 ---
 
@@ -1052,3 +1078,18 @@ process. Worth adding to `VgiSqlLogicTestSweepTest`'s eligibility gate alongside
   options — not as a curated `.test` replay, since that file's own setup uses DuckDB-only `COPY ...
   TO`/`vgi_table_branches()` syntax Spark can't execute regardless. Full `./gradlew :connector:test`
   green (60/60).
+- **2026-08-26** — Tier 2 items 7a (struct/list scalar args/returns) and 7e (nested/complex return
+  types) done — **all of item 7, and all of Tier 2, is now complete**. `VgiScalarValueBridge` reads/
+  writes nested Arrow `StructVector`/`ListVector`/`FixedSizeListVector` cells recursively, to
+  arbitrary depth (`writeAt` refactored to delegate through a new recursive `writeValue` core, via
+  Spark's own `InternalRow.get(ordinal, dataType)` rather than per-type direct getters — verified
+  behavior-preserving by the full existing suite staying green unchanged); `VgiTypeMapping
+  .toArrowField` recurses through `StructType`/`ArrayType` too; `readPlainValue` gained a matching
+  struct/list plain-value conversion for const arguments. 7e turned out to already be fully covered
+  by 7a's recursive design, confirmed live against the hardest real shape in the corpus
+  (`unnest_tensor`'s any-typed struct argument + dynamically-shaped nested-list-of-structs return) —
+  no additional code needed. Zero curated-conformance-test payoff for either sub-item, confirmed via
+  the general sweep: all 4 target files (`geo_centroid.test`, `geo_distance.test`,
+  `binary_packet.test`, `unnest_tensor.test`) exclusively use DuckDB struct/array LITERAL syntax
+  Spark's parser can't parse at all. Verified instead with 5 new live `VgiCatalogQueryTest`
+  regressions against the real fixture functions. Full `./gradlew :connector:test` green (65/65).

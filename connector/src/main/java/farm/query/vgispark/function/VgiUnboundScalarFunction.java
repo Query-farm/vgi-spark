@@ -149,7 +149,7 @@ final class VgiUnboundScalarFunction implements UnboundFunction {
             if (!VgiScalarValueBridge.isSupported(realType)) {
                 throw new UnsupportedOperationException(context + ": argument '" + staticField.getName()
                         + "' is any-typed and this call site's real type " + realType
-                        + " is not bridged (struct/list/map arguments are a later phase)");
+                        + " is not bridged (map arguments, or a struct/list containing an unsupported nested type, aren't bridged)");
             }
             resolvedInputTypes[i] = realType;
             resolvedFields.add(farm.query.vgispark.types.VgiTypeMapping.toArrowField(
@@ -170,7 +170,7 @@ final class VgiUnboundScalarFunction implements UnboundFunction {
                 if (!VgiScalarValueBridge.isSupported(realType)) {
                     throw new UnsupportedOperationException(context + ": vararg argument '" + varargSpec.getName()
                             + "' at position " + i + " has this call site's real type " + realType
-                            + ", which is not bridged (struct/list/map arguments are a later phase)");
+                            + ", which is not bridged (map arguments, or a struct/list containing an unsupported nested type, aren't bridged)");
                 }
                 resolvedInputTypes[i] = realType;
                 resolvedFields.add(farm.query.vgispark.types.VgiTypeMapping.toArrowField(
@@ -294,7 +294,7 @@ final class VgiUnboundScalarFunction implements UnboundFunction {
         }
         if (!VgiScalarValueBridge.isSupported(returnType)) {
             throw new UnsupportedOperationException(context + ": return type " + returnType
-                    + " is not bridged yet (struct/list/map returns are a later phase)");
+                    + " is not bridged yet (map returns, or a struct/list containing an unsupported nested type, aren't bridged)");
         }
         return returnType;
     }
@@ -338,7 +338,7 @@ final class VgiUnboundScalarFunction implements UnboundFunction {
         }
         if (!VgiScalarValueBridge.isSupported(returnType)) {
             throw new UnsupportedOperationException(context + ": return type " + returnType
-                    + " is not bridged yet (struct/list/map returns are a later phase)");
+                    + " is not bridged yet (map returns, or a struct/list containing an unsupported nested type, aren't bridged)");
         }
         return returnType;
     }
@@ -504,7 +504,7 @@ final class VgiUnboundScalarFunction implements UnboundFunction {
             if (!VgiScalarValueBridge.isSupported(type)) {
                 throw new UnsupportedOperationException(context + ": argument '" + field.getName()
                         + "' has type " + type + ", which scalar-function calls don't bridge yet "
-                        + "(struct/list/map arguments are a later phase)");
+                        + "(map arguments, or a struct/list containing an unsupported nested type, aren't bridged)");
             }
             inputTypes[i] = type;
         }

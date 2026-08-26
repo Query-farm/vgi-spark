@@ -698,4 +698,97 @@ class VgiCatalogQueryTest {
             java.nio.file.Files.deleteIfExists(csvPath);
         }
     }
+
+    @Test
+    @Timeout(60)
+    void scalarFunctionAcceptsStructArguments() {
+        // geo_distance_struct(p1, p2) — roadmap item 7a: two struct<lat:double,
+        // lon:double> arguments — VgiScalarValueBridge's new StructVector
+        // read/write path.
+        double result = spark.sql("SELECT " + CATALOG + ".geo_distance_struct("
+                        + "named_struct('lat', 0.0::DOUBLE, 'lon', 0.0::DOUBLE), "
+                        + "named_struct('lat', 3.0::DOUBLE, 'lon', 4.0::DOUBLE)) AS r")
+                .collectAsList().get(0).getDouble(0);
+        assertEquals(5.0, result, 0.0001);
+    }
+
+    @Test
+    @Timeout(60)
+    void scalarFunctionAcceptsListAndFixedSizeListArguments() {
+        // geo_distance_list/geo_distance_fixed — roadmap item 7a: a
+        // list<double> argument (both VGI shapes map onto the same Spark
+        // ArrayType) — VgiScalarValueBridge's new ListVector/
+        // FixedSizeListVector read/write path.
+        double listResult = spark.sql("SELECT " + CATALOG
+                        + ".geo_distance_list(array(0.0::DOUBLE, 0.0::DOUBLE), array(3.0::DOUBLE, 4.0::DOUBLE)) AS r")
+                .collectAsList().get(0).getDouble(0);
+        assertEquals(5.0, listResult, 0.0001);
+
+        double fixedResult = spark.sql("SELECT " + CATALOG
+                        + ".geo_distance_fixed(array(0.0::DOUBLE, 0.0::DOUBLE), array(3.0::DOUBLE, 4.0::DOUBLE)) AS r")
+                .collectAsList().get(0).getDouble(0);
+        assertEquals(5.0, fixedResult, 0.0001);
+    }
+
+    @Test
+    @Timeout(60)
+    void scalarFunctionCombinesVarargsWithStructArgumentsAndReturn() {
+        // geo_centroid_struct(points...) — roadmap items 7a + 7d combined: a
+        // vgi_varargs argument whose element type is itself a struct, AND a
+        // struct-typed RETURN value — exercises VgiScalarValueBridge's
+        // recursive read path on the way out, not just the write path in.
+        Row result = spark.sql("SELECT " + CATALOG + ".geo_centroid_struct("
+                        + "named_struct('lat', 0.0::DOUBLE, 'lon', 0.0::DOUBLE), "
+                        + "named_struct('lat', 4.0::DOUBLE, 'lon', 6.0::DOUBLE)) AS r")
+                .collectAsList().get(0);
+        Row centroid = result.getStruct(0);
+        assertEquals(2.0, centroid.getDouble(0), 0.0001);
+        assertEquals(3.0, centroid.getDouble(1), 0.0001);
+    }
+
+    @Test
+    @Timeout(60)
+    void scalarFunctionAcceptsAConstBinaryArgumentAndAConstStructArgument() {
+        // binary_packet(header, payload, config) — roadmap items 7a + 7c
+        // combined: a vgi_const BINARY argument, a plain per-row binary
+        // column, and a vgi_const STRUCT argument — exercises
+        // VgiScalarValueBridge.readPlainValue's new struct-to-Map path (the
+        // const struct's VALUE must travel into BindRequest.arguments).
+        byte[] result = (byte[]) spark.sql("SELECT " + CATALOG
+                        + ".binary_packet(X'CAFE', X'0102', named_struct('label', 'v1', 'version', 1::BIGINT)) AS r")
+                .collectAsList().get(0).get(0);
+        // header(CAFE) + payload(0102) + label('v1' -> 7631) + version(1 -> 01)
+        assertEquals("CAFE0102763101", bytesToHex(result));
+    }
+
+    private static String bytesToHex(byte[] bytes) {
+        StringBuilder sb = new StringBuilder();
+        for (byte b : bytes) sb.append(String.format("%02X", b));
+        return sb.toString();
+    }
+
+    @Test
+    @Timeout(60)
+    void scalarFunctionReturnsAListOfDynamicallyShapedStructs() {
+        // main.unnest_tensor(tensor) — roadmap item 7e: the hardest shape in
+        // the whole item-7 family. The ONE argument is any-typed at the WHOLE
+        // -STRUCT level (struct<tensor: list<any>, axes: struct<...variable
+        // field count/names...>>), and the RETURN type is itself dynamically
+        // computed by on_bind FROM that argument's actual shape:
+        // list<struct<value, axes: struct<...same variable fields...>>>.
+        // Exercises VgiTypeMapping.toArrowField/toSparkType's recursion (7a)
+        // together with the any-argument (7b) and dynamic-return (7b)
+        // resolution paths at once, on a shape no other live test reaches —
+        // a nested list-of-structs return, not just a struct/list argument.
+        Row result = spark.sql("SELECT " + CATALOG + ".main.unnest_tensor("
+                        + "named_struct('tensor', array(10, 20, 30), "
+                        + "'axes', named_struct('i', array(0, 1, 2)))) AS r")
+                .collectAsList().get(0);
+        List<Row> cells = result.getList(0);
+        assertEquals(3, cells.size());
+        for (Row cell : cells) {
+            int i = cell.<Row>getAs("axes").getInt(0);
+            assertEquals((i + 1) * 10, cell.getInt(0));
+        }
+    }
 }

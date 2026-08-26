@@ -76,11 +76,12 @@ import java.util.Map;
  * <h2>What's NOT supported yet</h2>
  *
  * <p>See {@link VgiUnboundScalarFunction}'s own validation: named arguments,
- * varargs, a return type that depends on a const argument's actual VALUE
- * (as opposed to any argument's TYPE, which IS supported — see {@link
- * VgiUnboundScalarFunction#bind}), and struct/list/map argument or return
- * values. Each makes {@code loadFunction} refuse the function outright with
- * a clear message — not a silent gap.
+ * a return type that depends on a const argument's actual VALUE (as opposed
+ * to any argument's TYPE, which IS supported — see {@link
+ * VgiUnboundScalarFunction#bind}), and a {@code map}-typed argument or
+ * return value (struct/list ARE supported, recursively — see {@link
+ * VgiScalarValueBridge}). Each makes {@code loadFunction} refuse the
+ * function outright with a clear message — not a silent gap.
  */
 final class VgiScalarFunction implements ScalarFunction<Object> {
 

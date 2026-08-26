@@ -8,6 +8,7 @@ import org.apache.arrow.vector.types.TimeUnit;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.FieldType;
+import org.apache.spark.sql.types.ArrayType;
 import org.apache.spark.sql.types.DataType;
 import org.apache.spark.sql.types.DataTypes;
 import org.apache.spark.sql.types.DecimalType;
@@ -157,20 +158,20 @@ public final class VgiTypeMapping {
      * this builds the Arrow field for that one call site's {@code
      * BindRequest.input_schema} on demand.
      *
-     * <p>Deliberately narrower than {@link #toSparkType}'s full range: only
-     * the primitive types {@code VgiScalarValueBridge} can actually read/
-     * write one-value-at-a-time (bool/byte/short/int/long/float/double/
-     * string/binary/date/timestamp/decimal) — the same set {@code
-     * VgiScalarValueBridge.isSupported} accepts. Struct/list/map arguments
-     * are out of scope for scalar functions in v1 regardless of whether they
-     * are statically or dynamically typed, so this method doesn't need to
-     * handle them.
+     * <p>Covers every type {@code VgiScalarValueBridge} can read/write:
+     * bool/byte/short/int/long/float/double/string/binary/date/timestamp/
+     * decimal, plus (roadmap tier 2 item 7a) {@code struct}/{@code list},
+     * recursively — the same set {@code VgiScalarValueBridge.isSupported}
+     * accepts. A {@code map} type has no mapping here (no real fixture needs
+     * one as an {@code any}-typed/vararg argument).
      *
-     * @throws UnsupportedOperationException if {@code type} isn't one of the
-     *         primitive types listed above
+     * @throws UnsupportedOperationException if {@code type} (or, for a
+     *         struct/list, any type nested within it) isn't one of the types
+     *         listed above
      */
     public static Field toArrowField(String name, DataType type, boolean nullable) {
         ArrowType arrowType;
+        List<Field> children = null;
         if (type.equals(DataTypes.BooleanType)) {
             arrowType = new ArrowType.Bool();
         } else if (type.equals(DataTypes.ByteType)) {
@@ -201,12 +202,20 @@ public final class VgiTypeMapping {
             arrowType = new ArrowType.Timestamp(TimeUnit.MICROSECOND, null);
         } else if (type instanceof DecimalType dt) {
             arrowType = new ArrowType.Decimal(dt.precision(), dt.scale(), 128);
+        } else if (type instanceof StructType st) {
+            arrowType = new ArrowType.Struct();
+            StructField[] fields = st.fields();
+            children = new java.util.ArrayList<>(fields.length);
+            for (StructField f : fields) children.add(toArrowField(f.name(), f.dataType(), f.nullable()));
+        } else if (type instanceof ArrayType at) {
+            arrowType = new ArrowType.List();
+            children = List.of(toArrowField("item", at.elementType(), at.containsNull()));
         } else {
             throw new UnsupportedOperationException(
                     "argument '" + name + "': no Arrow mapping for Spark type " + type.typeName()
-                            + " (only the primitive types a scalar-function call can bridge one value at a time)");
+                            + " (only the types a scalar-function call can bridge are supported)");
         }
-        return new Field(name, new FieldType(nullable, arrowType, null), null);
+        return new Field(name, new FieldType(nullable, arrowType, null), children);
     }
 
     private static UnsupportedOperationException unsupported(ArrowType type, String columnName) {
