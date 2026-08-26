@@ -2,6 +2,7 @@
 
 package farm.query.vgispark.client;
 
+import farm.query.vgi.SettingSpec;
 import farm.query.vgi.VgiService;
 import farm.query.vgi.protocol.CatalogAttachRequest;
 import farm.query.vgi.protocol.CatalogAttachResult;
@@ -14,6 +15,7 @@ import farm.query.vgirpc.transport.SubprocessTransport;
 import farm.query.vgirpc.transport.TcpSocketTransport;
 import farm.query.vgirpc.transport.UnixSocketTransport;
 import farm.query.vgispark.VgiCatalogConfig;
+import farm.query.vgispark.settings.SettingSpecDecoder;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -25,7 +27,9 @@ import java.nio.channels.SocketChannel;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Queue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -152,6 +156,53 @@ public final class VgiWorkerClient implements AutoCloseable {
 
     /** @return this client's configuration */
     public VgiCatalogConfig config() { return config; }
+
+    // Decoded once, lazily, from whichever connection happens to answer
+    // first — CatalogAttachResult.settings() is worker-level metadata (every
+    // pooled connection's own attach reports the identical list), not
+    // per-connection, so there's nothing to invalidate or re-derive per
+    // borrow. A plain (unsynchronized) field: a benign race decodes the same
+    // bytes into an equal map at most a handful of times at startup, never a
+    // correctness issue, and not worth a lock for.
+    private volatile Map<String, SettingSpec> declaredSettings;
+
+    /**
+     * @return this catalog's worker-declared session settings (name →
+     *         {@link SettingSpec}, carrying each setting's Arrow type), from
+     *         {@code CatalogAttachResult.settings} — what {@code
+     *         VgiUnboundScalarFunction} intersects against Spark's own
+     *         session config to build {@code BindRequest.settings} with the
+     *         correct wire type instead of guessing from a plain string.
+     */
+    public Map<String, SettingSpec> declaredSettings() {
+        Map<String, SettingSpec> cached = declaredSettings;
+        if (cached != null) return cached;
+        List<SettingSpec> specs = withConnection(a -> SettingSpecDecoder.decodeAll(a.attach().settings()));
+        Map<String, SettingSpec> byName = new LinkedHashMap<>();
+        for (SettingSpec spec : specs) byName.put(spec.name(), spec);
+        Map<String, SettingSpec> immutable = Map.copyOf(byName);
+        declaredSettings = immutable;
+        return immutable;
+    }
+
+    // Same lazy/cache rationale as declaredSettings above — CatalogAttachResult
+    // .default_schema is worker-level metadata, identical on every connection.
+    private volatile String defaultSchema;
+
+    /**
+     * @return the schema an unqualified (namespace-less) identifier resolves
+     *         against — {@code CatalogAttachResult.default_schema}, e.g.
+     *         {@code "main"} on the standard fixture worker — or {@code null}
+     *         if the worker didn't declare one (an unqualified reference then
+     *         stays unresolvable, same as before this existed).
+     */
+    public String defaultSchema() {
+        String cached = defaultSchema;
+        if (cached != null) return cached;
+        String resolved = withConnection(a -> a.attach().default_schema());
+        if (resolved != null) defaultSchema = resolved;
+        return resolved;
+    }
 
     /**
      * @return the dedicated executor for async connection acquisition

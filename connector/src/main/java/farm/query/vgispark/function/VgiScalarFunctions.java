@@ -58,7 +58,13 @@ public final class VgiScalarFunctions {
      * @param client the pooled connection to this catalog's VGI worker
      * @param config this catalog's configuration
      * @param ident the function identifier — its namespace must be exactly
-     *        one element (a VGI schema)
+     *        one element (a VGI schema), or empty, in which case it resolves
+     *        against the worker's own {@code CatalogAttachResult
+     *        .default_schema} — the shape an unqualified call like {@code
+     *        catalog.multiply_by_setting(v)} takes (Spark's 2-part
+     *        catalog-then-name resolution hands {@code loadFunction} an
+     *        Identifier with a zero-length namespace, not one naming the
+     *        schema)
      * @return the unbound function
      * @throws NoSuchFunctionException if no scalar function of that name
      *         exists in that schema
@@ -71,10 +77,14 @@ public final class VgiScalarFunctions {
      */
     public static UnboundFunction loadFunction(VgiWorkerClient client, VgiCatalogConfig config, Identifier ident)
             throws NoSuchFunctionException {
-        if (ident.namespace().length != 1) {
+        String schemaName;
+        if (ident.namespace().length == 1) {
+            schemaName = ident.namespace()[0];
+        } else if (ident.namespace().length == 0 && client.defaultSchema() != null) {
+            schemaName = client.defaultSchema();
+        } else {
             throw new NoSuchFunctionException(ident);
         }
-        String schemaName = ident.namespace()[0];
         String functionName = ident.name();
         ItemsResponse resp = client.withConnection(a -> a.service()
                 .catalog_schema_contents_functions(a.handle(), schemaName, "SCALAR_FUNCTION", null, null));

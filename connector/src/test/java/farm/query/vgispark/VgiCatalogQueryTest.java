@@ -267,4 +267,47 @@ class VgiCatalogQueryTest {
                 .collectAsList();
         assertEquals(4L, at2022.get(0).getLong(0));
     }
+
+    @Test
+    @Timeout(60)
+    void scalarFunctionReadsAnIntSettingViaSet() {
+        // multiply_by_setting(value) multiplies its input by the "multiplier"
+        // worker-declared int setting, read via BindRequest.settings — see
+        // VgiUnboundScalarFunction.currentSettingsBytes. Called unqualified
+        // (catalog.function, no schema — resolves against the worker's own
+        // default_schema, "main") exactly like the real
+        // settings/multiply_by_setting.test does.
+        spark.sql("SET multiplier = 5");
+        List<Row> rows = spark.sql(
+                "SELECT " + CATALOG + ".multiply_by_setting(v) FROM (VALUES (1), (2), (3)) AS t(v) ORDER BY v")
+                .collectAsList();
+        assertEquals(List.of(5L, 10L, 15L), rows.stream().map(r -> r.getLong(0)).toList());
+
+        // Changing the setting mid-session is reflected on the next bind —
+        // each call site re-binds (see VgiUnboundScalarFunction's own class
+        // javadoc: bind() runs once per call site, not cached across SETs).
+        spark.sql("SET multiplier = 10");
+        List<Row> rows2 = spark.sql(
+                "SELECT " + CATALOG + ".multiply_by_setting(v) FROM (VALUES (1), (2), (3)) AS t(v) ORDER BY v")
+                .collectAsList();
+        assertEquals(List.of(10L, 20L, 30L), rows2.stream().map(r -> r.getLong(0)).toList());
+
+        spark.sql("RESET multiplier");
+    }
+
+    @Test
+    @Timeout(60)
+    void scalarFunctionReadsAFloatSettingViaSet() {
+        // scale_by_setting(value) multiplies its input by the "scale_factor"
+        // worker-declared DOUBLE setting.
+        spark.sql("SET scale_factor = 2.5");
+        Row r1 = spark.sql("SELECT " + CATALOG + ".scale_by_setting(4.0)").collectAsList().get(0);
+        assertEquals(10.0, r1.getDouble(0), 0.0001);
+
+        spark.sql("SET scale_factor = 0.5");
+        Row r2 = spark.sql("SELECT " + CATALOG + ".scale_by_setting(10.0)").collectAsList().get(0);
+        assertEquals(5.0, r2.getDouble(0), 0.0001);
+
+        spark.sql("RESET scale_factor");
+    }
 }

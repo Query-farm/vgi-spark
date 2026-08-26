@@ -286,40 +286,89 @@ exercised, per the syntax-ceiling finding above).
 ## Tier 2 — real payoff, moderate new work
 
 ### 5. VGI views
-**Status:** ⬜ Not started
+**Status:** 🚫 Downgraded — investigated, real payoff is far smaller than originally estimated (see
+below); not worth building for sqllogictest purposes. Revisit only as a real production feature
+request, not a roadmap-driven one.
 
-**What it is:** `view/views.test`'s actual read queries (`SELECT COUNT(*) FROM example.first_ten`,
-`SELECT n FROM example.even_numbers`) are plain declarative SQL — a VGI-declared view just needs to
-show up as a readable `Table` in `VgiCatalog.loadTable`/`listTables`, backed by
-`catalog_schema_contents_views`/`ViewInfo` (already in `farm.query.vgi.protocol`, unused today).
+**What it is:** a VGI view (`ViewInfo`, from `catalog_schema_contents_views`/`catalog_view_get`) is
+**not** backed by its own scan function the way a table is — there's no `catalog_view_scan_*` RPC.
+`ViewInfo.definition` is a plain DuckDB SQL string, and DuckDB itself resolves a view by parsing and
+binding that string as if it were `CREATE VIEW ... AS <definition>` — i.e. re-entering DuckDB's own
+SQL engine recursively. There is no VGI-protocol shortcut around that.
 
-**What's needed:** `VgiCatalog.listTables` should also enumerate views (or a separate mechanism);
-`loadTable` needs to resolve a view name to its backing query/definition and expose it as a
-readable `VgiTable`-like `Table` — the simplest approach is likely "resolve the view's own
-underlying scan the same way a table resolves," if VGI views are themselves backed by a scan
-function per `ViewInfo`.
+**What investigation found:** the real `view/views.test`'s 3 views' actual definitions (from the
+standard fixture worker) are `first_ten: "SELECT * FROM sequence(10)"`, `even_numbers: "SELECT *
+FROM sequence(100) WHERE n % 2 = 0"`, `small_numbers: "SELECT * FROM numbers WHERE value < 10"`. The
+first two use DuckDB's own **built-in** `sequence()` table function — the identical Spark
+SQL-language ceiling already governing ~140 other files (see "Won't implement" below), just
+triggered by a DuckDB builtin instead of a VGI-catalog function this time. Only `small_numbers`
+(a plain `SELECT * FROM <real VGI table> WHERE <simple predicate>`) is even theoretically portable —
+and reaching it would mean writing a bespoke mini-parser for VGI's view-definition SQL strings (no
+existing infrastructure to reuse; a real DuckDB-dialect subset parser, not a config lookup), for
+**3 records total** in the whole 327-file corpus (`view/views.test` has 12 records: 8 blocked by
+`sequence()`, 1 by `duckdb_views()` introspection, 3 reachable in principle). Not a good
+effort-to-payoff ratio — explicitly downgraded rather than attempted.
 
-**Unlocks:** `view/views.test` (its declarative portion) — **1 file**. Small file count, but a
-clean, self-contained catalog feature.
+**Unlocks if ever revisited:** at most 3 records of `view/views.test`'s 12 (the `small_numbers`
+queries) — never the whole file, since the majority is hard-blocked by `sequence()` regardless. (One
+piece this would need — resolving an unqualified `example.viewname` reference — no longer needs
+inventing: item 6's `VgiWorkerClient.defaultSchema()` already does exactly that, for functions.)
 
 ---
 
 ### 6. Settings passthrough (`BindRequest.settings`)
-**Status:** ⬜ Not started
+**Status:** ✅ Done
 
 **What it is:** Spark session config (`SET`/`spark.conf.set(...)`) → `BindRequest.settings` (an
 Arrow-encoded batch, already a wire field `VgiUnboundScalarFunction`/`VgiScalarFunction` currently
 always pass `null` for).
 
-**What's needed:** decide the Spark-side settings mechanism (candidates: `SQLConf`/session
-properties read by name at `bind()` time, or catalog-config-level static settings) and thread
-through `SettingsEncoder` (already in `farm.query.vgi.client`, unused today) into
-`VgiUnboundScalarFunction.bind`'s `BindRequest`.
+**What shipped:** `VgiUnboundScalarFunction.currentSettingsBytes` intersects the worker's own
+declared settings (`CatalogAttachResult.settings`, decoded by a new `SettingSpecDecoder` — the same
+"first JVM client-side decoder for this wire shape" situation as item 1's `ScanBranchesDecoder`, and
+cached per-catalog on `VgiWorkerClient.declaredSettings()`) against whatever Spark's session actually
+has set (`SparkSession.active().conf()`), and encodes the matches via the already-existing
+`SettingsEncoder`. Only intersecting against worker-declared names (not a blanket `spark.*`-prefix
+guess) is both simpler and exactly correct — Spark's session config is full of unrelated entries with
+nothing to do with any VGI setting. Spark's own `SET key=value` stores every value as a plain STRING
+regardless of how it was written (unlike DuckDB's typed `SET`), so each matched value is parsed into
+the setting's *declared* Arrow type (from the same decoded `SettingSpec`) rather than sent as a string
+and hoped over — an unbridged declared type (anything beyond bool/int/float/utf8) is skipped, not
+guessed at.
 
-**Unlocks:** `settings/multiply_by_setting.test`, `settings_types.test` — **2 files** directly (both
-call scalar functions, no table-function-call ceiling). `settings/filter_by_setting.test`,
-`settings.test`, `struct_settings.test` are still blocked by the table-function-calling ceiling
-regardless — settings passthrough alone doesn't unlock them.
+**A second, necessary fix found along the way:** the real test files call these functions
+*unqualified* — `example.multiply_by_setting(v)`, catalog+name, no schema — which Spark resolves to
+a zero-length-namespace `Identifier`. `VgiScalarFunctions.loadFunction` previously refused any
+non-single-element namespace outright, so settings passthrough alone would NOT have unlocked
+anything (the exact same missing piece item 5's VGI-views investigation surfaced independently).
+Fixed by resolving a namespace-less identifier against `CatalogAttachResult.default_schema`
+(`"main"` on the standard fixture, now cached via a new `VgiWorkerClient.defaultSchema()`) instead of
+refusing — a real, worker-declared convention, not a hardcoded guess.
+
+**A real sweep-harness bug found and fixed too:** `VgiSqlLogicTestSweepTest`'s recent file-level
+parallelism (see its own change-log entry) shares ONE `SparkSession` across concurrently-running
+files — but `SET`/`RESET` mutate *session-scoped* runtime config, so two files' `SET`s could race
+each other once run concurrently, confirmed live (`multiply_by_setting.test` intermittently failed
+with `requires settings: ['multiplier']` — the setting simply not being there yet/anymore when the
+query ran). Fixed by giving each file its own `spark.newSession()` (isolated SQL config/temp views,
+same shared `SparkContext` and already-attached catalogs) instead of the one shared session — a
+test-harness fix, not a production one, but a real correctness bug nonetheless.
+
+**Unlocks — verified:**
+- `settings/multiply_by_setting.test` — passing curated conformance test
+  (`VgiSqlLogicTestConformanceTest.multiplyBySettingMatchesTheRealTestFile`, 5 executed / 2 skipped)
+  and now stably fully-passing in the general sweep too (10/191 files, was 9).
+- `settings/settings_types.test` — passing curated conformance test
+  (`.settingsTypesMatchesTheRealTestFile`, 5 executed / 3 skipped — the one skip is a
+  `duckdb_settings()` introspection query, unrelated to this feature).
+- 3 new live `VgiCatalogQueryTest` regression tests:
+  `scalarFunctionReadsAnIntSettingViaSet`, `scalarFunctionReadsAFloatSettingViaSet` (both settings),
+  plus the default-schema fix is exercised by both (unqualified `CATALOG.multiply_by_setting(...)`).
+- General sweep: 443 → 519 passing records overall across this item's three fixes (default-schema
+  resolution turned out to unlock far more than just these two files — any other record using an
+  unqualified `example.<function>` reference benefits too).
+- `settings/filter_by_setting.test`, `settings.test`, `struct_settings.test` remain blocked by the
+  table-function-calling ceiling regardless — settings passthrough alone doesn't reach them.
 
 ---
 
@@ -610,3 +659,17 @@ process. Worth adding to `VgiSqlLogicTestSweepTest`'s eligibility gate alongside
   files fully passing — consistent with less flaky-INTERNAL_ERROR exposure from a shorter run
   (14 occurrences → 2), not a behavior change; no concurrency-related errors (pool contention,
   deadlocks) appeared. Test-only change.
+- **2026-08-25** — Tier 2 item 5 (VGI views) investigated and downgraded, not built: real payoff is
+  ~3 records (2 of the file's 3 views use DuckDB's built-in `sequence()` table function — the same
+  ceiling as the ~140-file table-function-calling bucket), not the "1 file" originally estimated, and
+  reaching even those 3 needs a bespoke view-definition SQL parser with no existing infrastructure to
+  reuse. Not worth building for sqllogictest purposes; see the item's own entry for the full finding.
+- **2026-08-25** — Tier 2 item 6 (settings passthrough) done. Also fixed two things found along the
+  way: unqualified scalar-function calls (`example.multiply_by_setting(v)`, no schema) now resolve
+  against the worker's own `default_schema` instead of being refused outright (without this, settings
+  passthrough alone wouldn't have unlocked anything — the same gap item 5's investigation surfaced
+  independently); and a real race in `VgiSqlLogicTestSweepTest`'s new file-level parallelism, where
+  concurrently-running files could clobber each other's `SET`/`RESET` session state (fixed with
+  `spark.newSession()` per file). `settings/multiply_by_setting.test` and `settings_types.test` now
+  pass as curated conformance tests; general sweep 443 → 519 passing records (the default-schema fix
+  reaches well beyond just these two files).

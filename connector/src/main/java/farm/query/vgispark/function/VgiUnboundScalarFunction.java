@@ -2,7 +2,10 @@
 
 package farm.query.vgispark.function;
 
+import farm.query.vgi.SettingSpec;
 import farm.query.vgi.client.ArgumentsEncoder;
+import farm.query.vgi.client.ScalarValue;
+import farm.query.vgi.client.SettingsEncoder;
 import farm.query.vgi.protocol.BindRequest;
 import farm.query.vgi.protocol.BindResponse;
 import farm.query.vgi.protocol.FunctionInfo;
@@ -10,14 +13,18 @@ import farm.query.vgirpc.marshal.RecordCodec;
 import farm.query.vgispark.VgiCatalogConfig;
 import farm.query.vgispark.client.VgiWorkerClient;
 import farm.query.vgispark.types.ArrowSchemaCodec;
+import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
+import org.apache.spark.sql.RuntimeConfig;
+import org.apache.spark.sql.SparkSession;
 import org.apache.spark.sql.connector.catalog.functions.BoundFunction;
 import org.apache.spark.sql.connector.catalog.functions.UnboundFunction;
 import org.apache.spark.sql.types.DataType;
 import org.apache.spark.sql.types.StructType;
 
 import java.util.List;
+import java.util.Map;
 
 /**
  * A discovered, not-yet-bound VGI scalar function.
@@ -78,7 +85,7 @@ final class VgiUnboundScalarFunction implements UnboundFunction {
                 emptyArguments,
                 "SCALAR",
                 inputSchemaBytes,
-                null,           // settings — deferred, see class javadoc
+                currentSettingsBytes(client),
                 null,           // secrets — deferred, see class javadoc
                 null,           // attach_opaque_data — filled in per-connection below
                 null,           // transaction_opaque_data
@@ -103,6 +110,66 @@ final class VgiUnboundScalarFunction implements UnboundFunction {
         // the wrong declared shape to every init() call.
         return new VgiScalarFunction(config, info.name(), bindCallBytes, boundHolder[0].output_schema(), opaqueData,
                 inputSchemaBytes, inputTypes, returnType, deterministic);
+    }
+
+    /**
+     * Encode {@code BindRequest.settings} from whatever of the worker's own
+     * declared settings ({@link VgiWorkerClient#declaredSettings()}, from
+     * {@code CatalogAttachResult.settings}) the current Spark session
+     * actually has a value for — {@code SET name = value} / {@code
+     * spark.conf.set(name, value)}. Only names the worker itself declared are
+     * considered: Spark's session config is full of unrelated {@code
+     * spark.*}/{@code spark.sql.*} entries with nothing to do with any VGI
+     * setting, so intersecting against the worker's own declared names (not
+     * a blanket prefix guess) is both simpler and exactly correct.
+     *
+     * <p>Spark's own {@code SET} stores every value as a plain string
+     * regardless of how it was written (unlike DuckDB's typed {@code SET}),
+     * so each matched value is parsed into the setting's DECLARED Arrow type
+     * — {@link SettingSpec#type()} — rather than sent as a string and hoped
+     * over; a setting whose declared type isn't one of the handful bridged
+     * here is skipped, not guessed at (same "refuse rather than mis-scan"
+     * stance the rest of this connector takes).
+     *
+     * @return the encoded settings batch, or {@code null} if nothing matched
+     *         (letting the worker fall back to its own registered defaults
+     *         for every setting, exactly as if this feature didn't exist)
+     */
+    private static byte[] currentSettingsBytes(VgiWorkerClient client) {
+        Map<String, SettingSpec> declared = client.declaredSettings();
+        if (declared.isEmpty()) return null;
+
+        SparkSession spark = SparkSession.active();
+        RuntimeConfig conf = spark.conf();
+
+        SettingsEncoder encoder = SettingsEncoder.builder();
+        boolean any = false;
+        for (SettingSpec spec : declared.values()) {
+            String raw = conf.get(spec.name(), null);
+            if (raw == null) continue; // not SET this session — let the worker's own default apply
+            Object parsed = parseSettingValue(spec.type(), raw);
+            if (parsed == null) continue; // an unbridged type — see this method's own javadoc
+            encoder.setting(spec.name(), ScalarValue.of(spec.type(), parsed));
+            any = true;
+        }
+        return any ? encoder.encode() : null;
+    }
+
+    /**
+     * Parse a Spark {@code SET}-command string into the Java value shape
+     * {@link ScalarValue#of(ArrowType, Object)} expects for {@code type} —
+     * {@code null} if {@code type} isn't one of the handful bridged here
+     * (matches {@link VgiScalarValueBridge}'s own scoped-type stance, not a
+     * silent gap: exotic setting types are a follow-up, not attempted here).
+     */
+    private static Object parseSettingValue(ArrowType type, String raw) {
+        return switch (type.getTypeID()) {
+            case Bool -> Boolean.parseBoolean(raw);
+            case Int -> Long.parseLong(raw); // narrows correctly for any declared width — see VectorScalarCodec.write
+            case FloatingPoint -> Double.parseDouble(raw);
+            case Utf8, LargeUtf8 -> raw;
+            default -> null;
+        };
     }
 
     private static BindRequest withAttachHandle(BindRequest request, byte[] attachHandle) {

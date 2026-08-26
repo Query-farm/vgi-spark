@@ -252,4 +252,59 @@ class VgiSqlLogicTestConformanceTest {
         assertEquals(2, result.skipped(), "expected skip count changed — see REQUIRED_FILTERS_ROWID_NON_PORTABLE_MARKERS");
         assertEquals(4, result.executed(), "expected executed-record count changed");
     }
+
+    /**
+     * {@code settings/multiply_by_setting.test} (see {@code docs/ROADMAP.md},
+     * tier 2 item 6): {@code multiply_by_setting(value)} reads the
+     * worker-declared int setting {@code multiplier} via {@code
+     * BindRequest.settings}, called unqualified ({@code example
+     * .multiply_by_setting(v)} — no schema — resolving against the worker's
+     * {@code default_schema}, "main"). Every record is plain declarative SQL.
+     */
+    private static final List<String> MULTIPLY_BY_SETTING_NON_PORTABLE_MARKERS = List.of("ATTACH ", "DETACH");
+
+    @Test
+    @Timeout(180)
+    void multiplyBySettingMatchesTheRealTestFile() throws Exception {
+        Path testFile = VGI_TEST_ROOT.toPath().resolve("settings/multiply_by_setting.test");
+        Assumptions.assumeTrue(testFile.toFile().isFile(), testFile + " not present");
+
+        SqlLogicTestRunner.Result result = SqlLogicTestRunner.run(spark, testFile,
+                "example.", SPARK_CATALOG, MULTIPLY_BY_SETTING_NON_PORTABLE_MARKERS);
+
+        if (!result.failures().isEmpty()) {
+            fail(result.executed() + " executed, " + result.skipped() + " skipped, "
+                    + result.failures().size() + " FAILED:\n" + String.join("\n---\n", result.failures()));
+        }
+        assertEquals(2, result.skipped(), "expected skip count changed — see MULTIPLY_BY_SETTING_NON_PORTABLE_MARKERS");
+        assertEquals(5, result.executed(), "expected executed-record count changed");
+    }
+
+    /**
+     * {@code settings/settings_types.test} — a DOUBLE setting ({@code
+     * scale_factor}) read via the same settings-passthrough path. Non-portable:
+     * {@code ATTACH}/{@code DETACH} plus one {@code duckdb_settings()}
+     * introspection query (DuckDB-only, no Spark equivalent — unrelated to the
+     * settings feature itself, see {@code docs/ROADMAP.md}'s "Won't implement"
+     * section on DuckDB-only introspection).
+     */
+    private static final List<String> SETTINGS_TYPES_NON_PORTABLE_MARKERS =
+            List.of("ATTACH ", "DETACH", "duckdb_settings(");
+
+    @Test
+    @Timeout(180)
+    void settingsTypesMatchesTheRealTestFile() throws Exception {
+        Path testFile = VGI_TEST_ROOT.toPath().resolve("settings/settings_types.test");
+        Assumptions.assumeTrue(testFile.toFile().isFile(), testFile + " not present");
+
+        SqlLogicTestRunner.Result result = SqlLogicTestRunner.run(spark, testFile,
+                "example.", SPARK_CATALOG, SETTINGS_TYPES_NON_PORTABLE_MARKERS);
+
+        if (!result.failures().isEmpty()) {
+            fail(result.executed() + " executed, " + result.skipped() + " skipped, "
+                    + result.failures().size() + " FAILED:\n" + String.join("\n---\n", result.failures()));
+        }
+        assertEquals(3, result.skipped(), "expected skip count changed — see SETTINGS_TYPES_NON_PORTABLE_MARKERS");
+        assertEquals(5, result.executed(), "expected executed-record count changed");
+    }
 }
