@@ -541,6 +541,70 @@ struct-subfield pushdown, item 3).
 
 ---
 
+### 12. VGI table functions via `CALL` (`ProcedureCatalog`)
+**Status:** ✅ Done — real production capability, **zero sqllogictest sweep payoff** (see below)
+
+**What it is:** found while answering a direct question about this connector's table-function plan.
+Item 5/item 11-adjacent research (and a literal decompile of the Spark 4.2.0 jars this connector
+already depends on) surfaced `ProcedureCatalog` (SPARK-44167, shipped Spark 4.1): `CALL
+catalog.schema.procedure(args)`, whose `BoundProcedure.call(InternalRow): Iterator<Scan>` returns
+the SAME `Scan` interface `VgiScan` already implements. Not a workaround for the `FROM func(args)`/
+`LATERAL func(...)` ceiling (see the "Won't implement" entry above — confirmed structurally
+unrelated, `CALL` is reachable only from the grammar's top-level `statement` rule, never `relation`)
+— a genuinely different, additive calling convention: the plain (non-correlated) `SELECT * FROM
+func(args)` shape, spelled differently, as real SQL rather than a DataFrame-level escape hatch.
+
+**What shipped:** `VgiCatalog implements ProcedureCatalog`; a new `farm.query.vgispark.procedure`
+package (`VgiTableProcedures`, `VgiUnboundTableProcedure`, `ProcedureArgumentBridge`) mirroring
+`VgiScalarFunctions`'s discovery/resolution shape, scoped to `FunctionInfo.function_type() ==
+"TABLE"` only (table-in-out and buffering functions excluded — no `CALL`-compatible way to supply a
+TABLE argument). Unlike scalar functions, `call()` receives the call site's REAL argument VALUES (an
+`InternalRow`, not just types), so `vgi_const` arguments are NOT refused here — that limitation was
+specifically about Spark's scalar `bind(StructType)` only seeing types. Unqualified calls (`CALL
+catalog.func(...)`) resolve against `VgiWorkerClient.defaultSchema()`, reusing item 6's mechanism.
+
+**Two real bugs found and fixed along the way, both only discoverable by actually running it:**
+1. Wire argument encoding must match each argument's OWN declared kind (`argument_spec.py`:
+   positional args first by index, named ones after, stamped `{vgi_arg: named}`) — sending every
+   argument as `positional_N` regardless produced a worker-side `KeyError: "Argument 'n': not
+   found"` for `split_sequence`, whose own args are name-declared. Spark's `CALL` still supplies
+   every argument by the call site's positional order regardless of which wire form each one needs
+   (mirroring what DuckDB's own client-side binder must do for the identical positional
+   `split_sequence(30, 6)` call to work at all) — fixed by checking each argument field's own
+   `vgi_arg` metadata and routing to `ArgumentsEncoder.positional`/`.named` accordingly.
+2. A genuine Spark 4.2.0 version limitation, not a bug in this connector: returning a plain `VgiScan`
+   (the normal `Batch`/`InputPartition`-based distributed path) from `call()` fails with `[INTERNAL_
+   ERROR] Only local scans are temporarily supported as procedure output`. Spark's own wording
+   ("temporarily") suggests this is a still-maturing part of the new `ProcedureCatalog` SPI, not a
+   permanent design constraint. Worked around for v1 by draining the scan EAGERLY, on the driver, via
+   a small `materializeRows` helper (reusing `VgiScan`'s own plan/split/`VgiPartitionReaderFactory`
+   pipeline unchanged, just run synchronously instead of distributed across executors) into a
+   `LocalScan` wrapping real `InternalRow[]`s — correct for the admin/utility-call sizes `CALL` is
+   realistically used for, but not a distributed read; a huge table function's result would need to
+   fit in driver memory. Revisit the distributed path once/if a future Spark release lifts this.
+
+**Not yet threaded through:** VGI-declared argument DEFAULTS (`ArgumentSpec.default_json`) — every
+argument must be supplied explicitly today; a call relying on a default is refused by Spark's own
+analyzer (`REQUIRED_PARAMETER_NOT_FOUND`) before ever reaching this connector, confirmed live against
+`split_sequence`'s own defaulted second argument. Settings/secrets are also not threaded through
+`BindRequest.settings`/`.secrets` for procedure calls (scalar functions have this, item 6; not
+ported here yet).
+
+**Unlocks: none via the sqllogictest sweep, confirmed by checking, not assumed.** Grepped the whole
+corpus for `CALL ` — every match is DuckDB's own unrelated `CALL enable_logging(...)`-style
+diagnostic pragma (already in "Won't implement" — DuckDB-only introspection), never a VGI table
+function call (DuckDB itself calls those via `FROM func(args)`, not `CALL`). Verified instead by two
+new live `VgiCatalogQueryTest` regression tests: `callsARealTableFunctionViaCallSyntax` (a genuine
+split-capable function, `split_sequence(30, 6)`, real result values checked row-by-row) and
+`callsATableFunctionUnqualifiedViaDefaultSchema` (the no-schema default-schema-resolution path).
+
+**Verification:** `connector/src/main/java/farm/query/vgispark/procedure/` (all three classes),
+`VgiCatalog.listProcedures`/`.loadProcedure`. Tests: `VgiCatalogQueryTest
+.callsARealTableFunctionViaCallSyntax` / `.callsATableFunctionUnqualifiedViaDefaultSchema` (live,
+real worker) — no curated conformance test, since no real corpus file uses this calling shape.
+
+---
+
 ## Tier 3 — real gaps, lower payoff or higher uncertainty
 
 - **rowid hidden from `SELECT *`** — already attempted once (`SupportsMetadataColumns`), reverted
@@ -599,17 +663,21 @@ struct-subfield pushdown, item 3).
 
 ## Won't implement (with reasons — revisit only if the reasoning changes)
 
-- **VGI table-function / table-in-out-function calling via SQL** (`FROM catalog.func(...)`,
-  `func((SELECT ...))`, `LATERAL func(...)`). Blocks ~140 files across `accumulate/`,
-  `filter_pushdown/` (all 13), most of `table/` (~33), all of `table_in_out/` (43), most of
-  `splits/` (20 of 21), most of `secret/`/`settings/`, `macro/`'s table-macro portion, `overload/`'s
-  table files, `global_functions/`'s table/aggregate/table_buffering portions. This is a Spark
-  SQL-*language* ceiling — Spark has no `TABLE(...)`-with-arguments call syntax reachable from a
-  catalog-provided function (its newer Python-UDTF `TABLE` argument syntax is Spark-registered-
-  function-only, not extensible to arbitrary DataSource-catalog functions). Revisit only if Spark
-  itself ever adds such syntax. A DataFrame-level programmatic call API (`VgiTableFunctions.call(spark,
-  "catalog.schema.fn", args...)`) remains a possible **separate**, non-SQL escape hatch — deferred
-  per the original plan's decision, not reconsidered here.
+- **`FROM catalog.func(...)` / `LATERAL func(...)` (correlated, per-row table-function calls)**.
+  Confirmed by direct inspection of Spark 4.2.0's own jars and grammar (not assumed — decompiled
+  `org.apache.spark.sql.connector.catalog.functions`, which has `ScalarFunction`/`AggregateFunction`/
+  `UnboundFunction`/etc. but no `TableFunction` at all, and fetched the actual `SqlBaseParser.g4`
+  `relation`/`tableValuedFunction` productions, which resolve only against Spark's session-level
+  `TableFunctionRegistry` — builtins plus SQL-body `CREATE FUNCTION ... RETURNS TABLE` macros, no
+  catalog-plugin hook whatsoever). This remains a real Spark SQL-*language* ceiling for the
+  correlated/`FROM`-clause calling shape specifically. Revisit only if Spark itself adds a
+  table-function catalog SPI. See item 12 below for what turned out to be achievable instead —
+  non-correlated table-function calls via `CALL`, a real capability this connector now ships, though
+  it doesn't unlock any of the files below (different call syntax than what they're written with).
+  Still blocks ~140 files across `accumulate/`, `filter_pushdown/` (all 13), most of `table/` (~33),
+  all of `table_in_out/` (43), most of `splits/` (20 of 21), most of `secret/`/`settings/`, `macro/`'s
+  table-macro portion, `overload/`'s table files, `global_functions/`'s table/aggregate/
+  table_buffering portions.
 - **`COPY ... FROM/TO (FORMAT '...')`** (11 files: `copy_from/` all 3, `copy_to/` all 8). DuckDB's
   COPY statement grammar has no Spark equivalent, and unlike other gaps there's no portable
   remainder even in principle — every file's verification reads a local DuckDB table populated by
@@ -748,3 +816,15 @@ process. Worth adding to `VgiSqlLogicTestSweepTest`'s eligibility gate alongside
   `main.even_numbers` never reaches `VgiCatalog` at all today, since it's a VIEW and views aren't yet
   surfaced through `TableCatalog`. `table/column_statistics.test` (partial credit, 9/74 records) and
   `attach/ddl_wire_contract.test` (full file, 7/7 records) now pass as curated conformance tests.
+- **2026-08-25** — New Tier 2 item 12 (VGI table functions via `CALL`/`ProcedureCatalog`) added and
+  done, prompted by a direct question about this connector's table-function plan. Confirmed via a
+  literal decompile of Spark 4.2.0's own jars and grammar that `FROM func(args)`/`LATERAL func(...)`
+  remain a real, structural ceiling (updated that "Won't implement" entry with the confirming detail),
+  but found and shipped a genuinely new, additive capability: `CALL catalog.schema.func(args)` via
+  Spark 4.1's `ProcedureCatalog` SPI, whose `BoundProcedure.call` returns the same `Scan` interface
+  `VgiScan` already implements. Found and fixed two real bugs along the way (wire argument encoding
+  must match each argument's own positional-vs-named declared kind, not assume positional; Spark
+  4.2.0's `CALL` execution currently accepts only `LocalScan` output, not a distributed `VgiScan`,
+  worked around by eagerly draining the scan on the driver). Zero sqllogictest sweep payoff (confirmed
+  by grepping the corpus — no file uses `CALL` for a VGI table function), verified instead via two new
+  live regression tests.

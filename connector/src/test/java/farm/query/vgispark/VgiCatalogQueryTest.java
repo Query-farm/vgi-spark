@@ -449,4 +449,39 @@ class VgiCatalogQueryTest {
         assertTrue(addColumn.getMessage().toLowerCase().contains("read-only"),
                 "expected a read-only refusal message, got: " + addColumn.getMessage());
     }
+
+    @Test
+    @Timeout(60)
+    void callsARealTableFunctionViaCallSyntax() {
+        // split_sequence(n, splits) is a genuine split-capable table function
+        // (main schema, registered with default splits=4) — CALL exercises
+        // VgiCatalog's new ProcedureCatalog path end to end: discovery,
+        // real-argument-value binding (a REAL bind() RPC, not just a static
+        // FunctionInfo lookup), table_function_plan, and the same
+        // VgiPartitionReader split-reading machinery a declarative table's
+        // scan already uses. See VgiUnboundTableProcedure's own javadoc for
+        // why CALL, not FROM split_sequence(30, 6)/LATERAL.
+        List<Row> rows = spark.sql("CALL " + CATALOG + ".main.split_sequence(30, 6)").collectAsList();
+        assertEquals(30, rows.size(), "split_sequence(30, 6) should produce 30 rows");
+        List<Long> values = rows.stream().map(r -> r.getLong(0)).sorted().toList();
+        for (int i = 0; i < 30; i++) {
+            assertEquals((long) i, values.get(i), "row " + i + " mismatch");
+        }
+    }
+
+    @Test
+    @Timeout(60)
+    void callsATableFunctionUnqualifiedViaDefaultSchema() {
+        // No schema in the call — CALL vgi_example.split_sequence(...), not
+        // vgi_example.main.split_sequence(...) — resolves against the
+        // worker's default_schema ("main"), same as scalar functions. Both
+        // arguments are supplied explicitly: this connector doesn't thread
+        // VGI's own declared argument defaults into ProcedureParameter yet
+        // (a real, separate gap from default-schema resolution — see
+        // VgiUnboundTableProcedure's own tryBuild), so a call relying on
+        // split_sequence's second-argument default would be refused by
+        // Spark's own analyzer before ever reaching this connector.
+        List<Row> rows = spark.sql("CALL " + CATALOG + ".split_sequence(5, 2)").collectAsList();
+        assertEquals(5, rows.size());
+    }
 }

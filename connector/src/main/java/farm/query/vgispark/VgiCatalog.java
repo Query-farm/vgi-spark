@@ -14,6 +14,7 @@ import farm.query.vgispark.branch.ScanBranchesDecoder;
 import farm.query.vgispark.branch.VgiScanBranch;
 import farm.query.vgispark.client.VgiWorkerClient;
 import farm.query.vgispark.function.VgiScalarFunctions;
+import farm.query.vgispark.procedure.VgiTableProcedures;
 import org.apache.spark.sql.catalyst.analysis.NamespaceAlreadyExistsException;
 import org.apache.spark.sql.catalyst.analysis.NoSuchFunctionException;
 import org.apache.spark.sql.catalyst.analysis.NoSuchNamespaceException;
@@ -22,11 +23,13 @@ import org.apache.spark.sql.catalyst.analysis.TableAlreadyExistsException;
 import org.apache.spark.sql.connector.catalog.FunctionCatalog;
 import org.apache.spark.sql.connector.catalog.Identifier;
 import org.apache.spark.sql.connector.catalog.NamespaceChange;
+import org.apache.spark.sql.connector.catalog.ProcedureCatalog;
 import org.apache.spark.sql.connector.catalog.SupportsNamespaces;
 import org.apache.spark.sql.connector.catalog.Table;
 import org.apache.spark.sql.connector.catalog.TableCatalog;
 import org.apache.spark.sql.connector.catalog.TableChange;
 import org.apache.spark.sql.connector.catalog.functions.UnboundFunction;
+import org.apache.spark.sql.connector.catalog.procedures.UnboundProcedure;
 import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 
 import java.util.ArrayList;
@@ -53,13 +56,14 @@ import java.util.Map;
  * farm.query.vgispark.scan.VgiScan}) and projection/filter/limit pushdown
  * (see {@link farm.query.vgispark.scan.VgiScanBuilder}), plus a scoped
  * subset of catalog scalar functions (see {@link VgiScalarFunctions} for
- * exactly what's supported) and time travel ({@code VERSION AS OF}/{@code
- * TIMESTAMP AS OF} — see {@link #loadTable(Identifier, String)}/{@link
- * #loadTable(Identifier, long)}). No views, no VGI table functions (Spark has
- * no SQL equivalent to Trino's {@code TABLE(...)} syntax) — see {@code
- * docs/ROADMAP.md} for what's next.
+ * exactly what's supported), plain table functions callable via {@code CALL}
+ * (see {@link VgiTableProcedures} — NOT {@code FROM func(args)}/{@code
+ * LATERAL func(...)}, which remain a genuine Spark SQL-grammar ceiling), and
+ * time travel ({@code VERSION AS OF}/{@code TIMESTAMP AS OF} — see {@link
+ * #loadTable(Identifier, String)}/{@link #loadTable(Identifier, long)}). No
+ * views — see {@code docs/ROADMAP.md} for what's next.
  */
-public final class VgiCatalog implements TableCatalog, SupportsNamespaces, FunctionCatalog {
+public final class VgiCatalog implements TableCatalog, SupportsNamespaces, FunctionCatalog, ProcedureCatalog {
 
     private String name;
     private VgiCatalogConfig config;
@@ -318,6 +322,22 @@ public final class VgiCatalog implements TableCatalog, SupportsNamespaces, Funct
     @Override
     public UnboundFunction loadFunction(Identifier ident) throws NoSuchFunctionException {
         return VgiScalarFunctions.loadFunction(client, config, ident);
+    }
+
+    // ------------------------------------------------------------------
+    // ProcedureCatalog — plain table functions via CALL; see
+    // VgiTableProcedures for what's actually supported and why CALL rather
+    // than FROM func(args)/LATERAL func(...).
+    // ------------------------------------------------------------------
+
+    @Override
+    public Identifier[] listProcedures(String[] namespace) {
+        return VgiTableProcedures.listProcedures(client, namespace);
+    }
+
+    @Override
+    public UnboundProcedure loadProcedure(Identifier ident) {
+        return VgiTableProcedures.loadProcedure(client, config, ident);
     }
 
     /**
