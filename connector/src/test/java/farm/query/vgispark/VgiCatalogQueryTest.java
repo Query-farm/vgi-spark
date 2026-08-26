@@ -82,6 +82,41 @@ class VgiCatalogQueryTest {
         assertTrue(names.contains("numbers"), "expected a 'numbers' table, got " + names);
     }
 
+    /**
+     * Spark's own catalog-introspection commands ({@code DESCRIBE TABLE},
+     * {@code SHOW COLUMNS}, {@code SHOW FUNCTIONS}, {@code SHOW CATALOGS})
+     * all work against {@code VgiCatalog} with zero connector-specific
+     * code — they're generic Catalyst implementations that call exactly the
+     * {@code TableCatalog}/{@code SupportsNamespaces}/{@code FunctionCatalog}
+     * SPI methods this catalog already implements. Only DuckDB's OWN
+     * introspection ({@code duckdb_*()}, {@code vgi_*()} — table-valued
+     * functions with a DuckDB-specific row shape) has no Spark equivalent;
+     * {@code DESCRIBE} itself is real Spark syntax that runs fine here, just
+     * with Spark's 3-column shape (col_name, data_type, comment) rather than
+     * DuckDB's 6-column one — see {@code docs/ROADMAP.md}'s corpus-overview
+     * table and this test's own assertions below for the distinction.
+     */
+    @Test
+    @Timeout(60)
+    void describesAndListsCatalogMetadataViaSparksOwnCommands() {
+        List<Row> described = spark.sql("DESCRIBE TABLE " + CATALOG + ".data.numbers").collectAsList();
+        assertEquals(1, described.size());
+        assertEquals("value", described.get(0).getString(0));
+        assertEquals("bigint", described.get(0).getString(1));
+
+        List<Row> columns = spark.sql("SHOW COLUMNS FROM " + CATALOG + ".data.numbers").collectAsList();
+        assertEquals(List.of("value"), columns.stream().map(r -> r.getString(0)).toList());
+
+        List<Row> functions = spark.sql("SHOW FUNCTIONS IN " + CATALOG + ".main").collectAsList();
+        List<String> functionNames = functions.stream().map(r -> r.getString(0)).toList();
+        assertTrue(functionNames.contains(CATALOG + ".main.global_scalar"),
+                "expected a catalog scalar function in SHOW FUNCTIONS, got " + functionNames);
+
+        List<Row> catalogs = spark.sql("SHOW CATALOGS").collectAsList();
+        assertTrue(catalogs.stream().anyMatch(r -> CATALOG.equals(r.getString(0))),
+                "expected '" + CATALOG + "' in SHOW CATALOGS, got " + catalogs);
+    }
+
     @Test
     @Timeout(60)
     void readsRealRowsFromTheNumbersTable() {
