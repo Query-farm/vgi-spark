@@ -15,11 +15,15 @@
 # settings.gradle.kts's own comment), so CI needs the same from-source build
 # local development uses, not the possibly-stale published artifact.
 #
-# Both refs are pinned to a specific SHA, not `main` — a floating ref is
-# exactly what vgi-java's own ci.yml/integration.yml comments warn broke
-# things there before. Bump these deliberately, in the same PR as whatever
-# vgi-spark change actually needs the newer commit, not as a routine
-# "keep up to date" churn.
+# VGI_JAVA_REF/VGI_RPC_JAVA_REF are pinned to a specific SHA, not `main` —
+# a floating ref there is exactly what vgi-java's own ci.yml/integration.yml
+# comments warn broke things before (these two are actual library
+# dependencies vgi-spark compiles against, so an unreviewed upstream change
+# can break the build with no vgi-spark change of its own). Bump them
+# deliberately, in the same PR as whatever vgi-spark change actually needs
+# the newer commit, not as a routine "keep up to date" churn. VGI_REF/
+# VGI_RUST_REF are kept floating on `main` on purpose (see each one's own
+# comment below) — always run against their current tip.
 name: CI
 
 on:
@@ -44,12 +48,15 @@ env:
   VGI_RPC_JAVA_REF: 00b1d1f43f19cda7d734047aae18380e1b2aa286
   # The DuckDB reference client repo — only its test/sql/integration/*.test
   # corpus is used here (the sqllogictest conformance suite and full-corpus
-  # sweep both just read these as plain text), never built.
-  VGI_REF: 486c6a1f815dd896884b526cd29c937a81abb344
+  # sweep both just read these as plain text), never built. Deliberately
+  # kept floating on `main`, unlike VGI_JAVA_REF/VGI_RPC_JAVA_REF above:
+  # always sweep against the corpus's current tip.
+  VGI_REF: main
   # The Rust worker this connector's own test suite runs against (see
-  # CLAUDE.md's "Test worker: vgi-rust, not vgi-python") — pinned the same
-  # way, for the same reason.
-  VGI_RUST_REF: 074ae2239a353bf8297a405b18c5bb0fefe9c032
+  # CLAUDE.md's "Test worker: vgi-rust, not vgi-python") — deliberately kept
+  # floating on `main`, unlike the other three refs above: always build
+  # against vgi-rust's current tip.
+  VGI_RUST_REF: main
 
 jobs:
   test:
@@ -75,7 +82,7 @@ jobs:
           ref: ${{ env.VGI_RPC_JAVA_REF }}
           path: vgi-rpc-java
 
-      - name: Checkout pinned vgi-rust
+      - name: Checkout vgi-rust (main)
         uses: actions/checkout@v4
         with:
           repository: Query-farm/vgi-rust
@@ -83,7 +90,7 @@ jobs:
           path: vgi-rust
 
       # Sparse: only the sqllogictest corpus is needed, never a C++ build.
-      - name: Checkout pinned vgi (sqllogictest corpus only)
+      - name: Checkout vgi (main, sqllogictest corpus only)
         uses: actions/checkout@v4
         with:
           repository: Query-farm/vgi
