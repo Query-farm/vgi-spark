@@ -298,7 +298,21 @@ regression to chase; re-enable if that gap is ever fixed), ~107 seconds
 wall clock on a 48-core box (under 4 minutes on a real 2-core GitHub-hosted
 CI runner). Sqllogictest sweep: 191 of 328 files eligible, 720 of 2952
 records pass (up from 711 before the NULL-argument fix) — up from a stale
-405/2944 baseline that predates this session's fixes.
+405/2944 baseline that predates this session's fixes. Also released v0.2.0
+(the first tag; see CHANGELOG.md) and documented real deployment (README's
+own "Deploying it" section — `connector:assembleDeployDir`, and the
+executor-reachability constraint for bare-command/`unix://`/`launch:`
+locations, confirmed in source, not assumed). Attempted an actual
+multi-process `local-cluster[...]` validation to verify that constraint and
+the Arrow/Netty exclusion end to end; abandoned it — `local-cluster` mode
+itself doesn't start cleanly in this environment even with zero custom
+config (`SparkContext` self-stops immediately, `IllegalStateException:
+Cannot call methods on a stopped SparkContext`), a separate, unrelated
+environment issue not worth chasing further right now. The Arrow/Netty
+exclusion is still evidence-based (Gradle's own test-classpath resolution
+already upgrades both, and the whole suite passes against those versions),
+just not verified via a genuinely separate-process executor the way the
+plan originally wanted.
 
 Work happened partly on a temporary EC2 instance (Amazon Linux 2023,
 aarch64/Graviton, Corretto 21) rather than the maintainer's own machine,

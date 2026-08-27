@@ -142,6 +142,54 @@ host RAM/CPU to budget; both scale to `Runtime.getRuntime().availableProcessors(
 On a modern multi-core machine the full suite (~76 tests, including the
 full sqllogictest sweep) runs in under two minutes.
 
+## Deploying it
+
+This module's own jar carries only its own compiled classes — there's no
+shadow/shade plugin, so it doesn't bundle its dependencies the way a
+self-contained fat jar would. `./gradlew :connector:assembleDeployDir`
+assembles everything a real Spark job needs into `connector/build/deploy/`:
+this connector's own jar plus every runtime dependency it doesn't already
+get from Spark's own classpath (`farm.query:vgi` and its own transitive
+`farm.query:vgirpc`). **Arrow and Netty jars are deliberately excluded**
+from that directory — Spark 4.2.0 itself bundles newer versions of both
+(Arrow 19.0.0, Netty 4.2.13.Final) than what `farm.query:vgi` pulls in
+transitively (Arrow 18.1.0, Netty 4.2.9.Final), and shipping the older
+copies too via `--jars` would put two conflicting majors on the same
+executor classpath. This isn't a guess: Gradle's own dependency resolution
+on this module's test classpath already upgrades both to Spark's versions,
+and this whole connector's test suite passes against those newer,
+Spark-provided versions on every run — proof they already satisfy whatever
+API surface `farm.query:vgi`/`farm.query:vgirpc` actually need.
+
+```bash
+./gradlew :connector:assembleDeployDir
+spark-submit \
+  --jars "$(echo connector/build/deploy/*.jar | tr ' ' ',')" \
+  --conf spark.sql.catalog.vgi_example=farm.query.vgispark.VgiCatalog \
+  --conf spark.sql.catalog.vgi_example.location='unix:///path/to/worker.sock' \
+  --conf spark.sql.catalog.vgi_example.catalog-name=example \
+  your_job.py
+```
+
+**A real deployment constraint worth planning for**: for a bare-command,
+`unix://`, or `launch:` `location`, each executor opens its own connection
+to the worker independently (`VgiPartitionReader` calls
+`VgiWorkerClient.connect` directly, on whichever executor Spark schedules
+a task to — confirmed in source, not assumed) — the driver never proxies
+data through itself. That means the worker command must be spawnable, or
+the `unix://` socket path reachable, from **every executor node**, not
+just wherever the driver runs. This only matters once driver and executors
+are genuinely different machines (a real cluster — everything in this
+repo's own test suite runs `local[N]`/single-process, where the
+distinction doesn't exist). `tcp://`/`http(s)://` locations don't have
+this constraint, since those just need the worker reachable over the
+network from every node, not spawnable/co-located on each one.
+
+**Spark/Scala compatibility**: built and tested against exactly Spark
+`4.2.0` / Scala `2.13`. Other Spark 4.x point releases or Scala `2.12` are
+untested — nothing here is deliberately incompatible with them, but don't
+assume it works without checking.
+
 ## Architecture
 
 Ported from [`vgi-trino`](https://github.com/Query-farm/vgi-trino)'s design —
