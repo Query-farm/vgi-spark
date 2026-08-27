@@ -33,12 +33,18 @@ import java.util.concurrent.TimeUnit;
  * {@code vgi-example-worker} is a single compiled binary with no
  * interpreter/dependency-resolution step at all — its own discovery line
  * appears in well under a second even under heavy machine load, vs. several
- * seconds (worse under contention) for {@code uv run}. Prefers {@code
- * target/debug/vgi-example-worker} over {@code target/release/...} when
- * both exist — in practice the more RECENTLY rebuilt one during active
- * {@code vgi-rust} development, and startup latency (this class's whole
- * concern) doesn't depend on the optimization level the way steady-state
- * throughput would.
+ * seconds (worse under contention) for {@code uv run}. When both {@code
+ * target/debug/vgi-example-worker} and {@code target/release/...} exist,
+ * picks whichever has the newer mtime — not a fixed preference either way:
+ * during active {@code vgi-rust} source development the debug build is
+ * usually the fresher one (a quick {@code cargo build}, no {@code
+ * --release}), but for actually RUNNING this connector's own test suite
+ * (this class's real purpose) an operator who deliberately built {@code
+ * --release} wants that optimized binary picked up, not silently
+ * shadowed by a stale-but-still-present debug one. Startup latency (spawn +
+ * discovery-line wait) doesn't depend on optimization level either way, but
+ * steady-state per-call throughput — real for a 327-file sqllogictest sweep
+ * moving real row data — does.
  *
  * <p>{@code unix}/{@code tcp} spawn the worker themselves and block-read its
  * stdout for the one discovery line ({@code UNIX:<path>} / {@code
@@ -59,9 +65,9 @@ public final class VgiWorkerHarness {
     public record Handle(String location, AutoCloseable teardown) {}
 
     /**
-     * @return the {@code vgi-example-worker} binary path, preferring a debug
-     *         build over a release one when both exist (see this class's
-     *         own javadoc for why)
+     * @return the {@code vgi-example-worker} binary path — whichever of the
+     *         debug/release builds is newer when both exist (see this
+     *         class's own javadoc for why)
      * @throws IllegalStateException if neither build exists — run {@code
      *         cargo build [--release] --bin vgi-example-worker} in {@code
      *         vgiRustDir} first
@@ -69,8 +75,18 @@ public final class VgiWorkerHarness {
     public static Path workerBinary(File vgiRustDir) {
         Path debug = vgiRustDir.toPath().resolve("target/debug/vgi-example-worker");
         Path release = vgiRustDir.toPath().resolve("target/release/vgi-example-worker");
-        if (Files.isExecutable(debug)) return debug;
-        if (Files.isExecutable(release)) return release;
+        boolean debugOk = Files.isExecutable(debug);
+        boolean releaseOk = Files.isExecutable(release);
+        if (debugOk && releaseOk) {
+            try {
+                return Files.getLastModifiedTime(debug).compareTo(Files.getLastModifiedTime(release)) >= 0
+                        ? debug : release;
+            } catch (IOException e) {
+                return debug; // mtime read raced a concurrent rebuild — either binary works, just pick one
+            }
+        }
+        if (debugOk) return debug;
+        if (releaseOk) return release;
         throw new IllegalStateException("vgi-example-worker binary not found under " + vgiRustDir
                 + "/target/{debug,release} — run `cargo build --bin vgi-example-worker` (or --release) there first");
     }
