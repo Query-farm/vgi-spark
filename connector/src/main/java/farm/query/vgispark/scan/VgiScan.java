@@ -332,9 +332,11 @@ public final class VgiScan implements Scan, Batch, SupportsReportStatistics {
         // DIFFERENT pooled connection, so the handle can't be re-derived
         // afterward from whichever connection happens to be borrowed next.
         byte[][] attachHandleUsed = new byte[1][];
+        byte[][] boundOutputSchema = new byte[1][];
         byte[] bindOpaqueData = client.withConnection(a -> {
             attachHandleUsed[0] = a.handle();
             BindResponse bound = a.service().bind(withAttachHandle(bindRequest, a.handle()), null);
+            boundOutputSchema[0] = bound.output_schema();
             return bound.opaque_data();
         });
         byte[] bindCall = RecordCodec.serializeToBytes(withAttachHandle(bindRequest, attachHandleUsed[0]));
@@ -401,13 +403,42 @@ public final class VgiScan implements Scan, Batch, SupportsReportStatistics {
             // safe to ignore rather than fan out further here.
             cursor = nextCursors.get(0);
         }
+        // Last-branch-wins: fine for the overwhelmingly common single-function-
+        // branch case (multi-branch scans where different branches' backing
+        // functions disagree on column NAMING are not a scenario this
+        // connector's own multi-branch support has ever exercised — see
+        // #createReaderFactory's own note on why this is safe here).
+        boundOutputSchemaBytes = boundOutputSchema[0];
         return partitions;
     }
 
+    // Set by planBranchPartitions — the scan FUNCTION's own bind-resolved
+    // output schema, as opposed to table.outputSchemaBytes() (the
+    // DECLARATIVE table's own advertised column names). A declarative table
+    // can legitimately rename its backing function's raw columns (e.g. the
+    // reference fixture's data.numbers table declares column "value" over
+    // main.sequence's own raw "n") — Spark never notices, since a
+    // ColumnarBatch's Arrow vectors are matched to VgiScan#readSchema
+    // PURELY BY POSITION (see readSchema's own comment), never by name. But
+    // the WIRE protocol (InitRequest.output_schema, which the worker uses to
+    // narrow/project each raw batch BY NAME before sending it — see
+    // vgi-rust's own project_batch) and this class's OWN local
+    // VectorSchemaRoot.getVector(name) lookup in VgiPartitionReader#next
+    // both need the RAW function-level names to actually find anything —
+    // using the declared ("value") name for either was a real bug (a bind
+    // that resolves fine still fails downstream with "projection column
+    // 'value' not found in input" the moment a real batch comes back
+    // carrying "n"). null only when planInputPartitions() never ran a
+    // function branch at all (pure FORMAT-branch scans) — falls back to the
+    // table's own declared schema, which for that case is never sent over
+    // the wire this way to begin with.
+    private volatile byte[] boundOutputSchemaBytes;
+
     @Override
     public PartitionReaderFactory createReaderFactory() {
+        byte[] wireSchema = boundOutputSchemaBytes != null ? boundOutputSchemaBytes : table.outputSchemaBytes();
         return new VgiPartitionReaderFactory(
-                config, table.outputSchemaBytes(), projectionIds, pushdownFiltersBytes, rowLimit);
+                config, wireSchema, projectionIds, pushdownFiltersBytes, rowLimit);
     }
 
     private static BindRequest withAttachHandle(BindRequest request, byte[] attachHandle) {
