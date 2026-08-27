@@ -11,6 +11,8 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.parallel.Execution;
+import org.junit.jupiter.api.parallel.ExecutionMode;
 
 import java.io.File;
 import java.nio.file.Path;
@@ -37,6 +39,17 @@ import static org.junit.jupiter.api.Assertions.fail;
  * both files — see each test's own marker list for exactly what and why.
  */
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
+// Each of this class's ~15-20 @Test methods only reads a curated .test file
+// off disk and runs it against the ONE shared, already-attached, read-only
+// SparkSession/worker start() builds below — nothing here mutates instance
+// state a sibling method could race on (each call returns its own Result,
+// asserted locally). Running JUnit 5's default sequential-methods mode left
+// this whole class's real work (~15-20 independent Spark+RPC round trips)
+// serialized behind a single thread even though Gradle already isolates this
+// class into its own forked JVM — @Execution flips just THIS class's methods
+// to run concurrently (junit-platform.properties keeps every other class at
+// the default same_thread mode, unaffected).
+@Execution(ExecutionMode.CONCURRENT)
 class VgiSqlLogicTestConformanceTest {
 
     private static final File VGI_RUST = new File(System.getProperty("user.home"), "Development/vgi-rust");
@@ -44,6 +57,12 @@ class VgiSqlLogicTestConformanceTest {
             new File(System.getProperty("user.home"), "Development/vgi/test/sql/integration");
     private static final String SPARK_CATALOG = "vgi_example";
     private static final String VGI_CATALOG_NAME = "example";
+    // Matches the pool/executor width to the method-level concurrency
+    // @Execution(CONCURRENT) above now introduces — same rationale as
+    // VgiSqlLogicTestSweepTest's own FILE_PARALLELISM, just smaller (this
+    // class has ~15-20 methods total, not 327 files).
+    private static final int METHOD_PARALLELISM =
+            Math.max(2, Math.min(16, Runtime.getRuntime().availableProcessors()));
 
     private VgiWorkerHarness.Handle worker;
     private SparkSession spark;
@@ -59,12 +78,25 @@ class VgiSqlLogicTestConformanceTest {
         worker = VgiWorkerHarness.unix(VGI_RUST);
 
         spark = SparkSession.builder()
-                .master("local[2]")
+                // local[2] -> local[METHOD_PARALLELISM]: @Execution(CONCURRENT)
+                // above now submits multiple methods' spark.sql() calls at
+                // once from different JUnit threads (safe — one SparkSession
+                // serving concurrent callers is a supported pattern, same as
+                // VgiSqlLogicTestSweepTest's own identical reasoning); a
+                // 2-thread executor would just serialize their actual task
+                // execution behind the concurrent callers instead of gaining
+                // anything from them.
+                .master("local[" + METHOD_PARALLELISM + "]")
                 .appName("vgi-spark-sqllogictest-conformance")
                 .config("spark.ui.enabled", "false")
                 .config("spark.sql.catalog." + SPARK_CATALOG, VgiCatalog.class.getName())
                 .config("spark.sql.catalog." + SPARK_CATALOG + ".location", worker.location())
                 .config("spark.sql.catalog." + SPARK_CATALOG + ".catalog-name", VGI_CATALOG_NAME)
+                // Bumped from the connector's own default: the driver-side
+                // VgiWorkerClient pool is shared across every concurrently-
+                // running method's thread now — matches METHOD_PARALLELISM so
+                // concurrent methods don't serialize waiting on pool borrows.
+                .config("spark.sql.catalog." + SPARK_CATALOG + ".connections", String.valueOf(METHOD_PARALLELISM))
                 .getOrCreate();
     }
 
