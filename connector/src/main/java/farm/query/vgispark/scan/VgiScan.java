@@ -314,10 +314,17 @@ public final class VgiScan implements Scan, Batch, SupportsReportStatistics {
                 table.atUnit(), table.atValue(),
                 null, null,     // copy_from / copy_to
                 // NOT table.schemaName(): the scan function's own registered schema can
-                // differ from the table's schema (declarative tables) or is simply
-                // unknown for a branch (multi-branch). null lets the worker's
-                // dispatcher search every schema by name.
-                null);
+                // differ from the table's schema (declarative tables — e.g. the
+                // reference fixture's data.numbers table scans via main.sequence, a
+                // DIFFERENT schema). Resolved instead via VgiWorkerClient
+                // .scanFunctionSchema, a one-time catalog-wide sweep keyed by
+                // function name — VGI protocol 1.1.0 requires a bind to name its
+                // owning schema (a strict worker refuses an unqualified bind outright
+                // rather than searching every schema by name, the assumption this
+                // code used to make); null falls through only for a scan function the
+                // worker deliberately hid from its own catalog listing, which the
+                // wire dispatch rules accept unqualified.
+                client.scanFunctionSchema(branch.functionName()));
 
         // withConnection's own attach handle must be the SAME one baked into
         // the serialized bindCall below — table_function_plan and every

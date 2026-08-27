@@ -7,11 +7,15 @@ import farm.query.vgi.VgiService;
 import farm.query.vgi.client.SettingsEncoder;
 import farm.query.vgi.protocol.CatalogAttachRequest;
 import farm.query.vgi.protocol.CatalogAttachResult;
+import farm.query.vgi.protocol.FunctionInfo;
+import farm.query.vgi.protocol.ItemsResponse;
+import farm.query.vgi.protocol.SchemaInfo;
 import farm.query.vgirpc.RpcConnection;
 import farm.query.vgirpc.http.HttpRpcConnection;
 import farm.query.vgirpc.launcher.LaunchConfig;
 import farm.query.vgirpc.launcher.LauncherClient;
 import farm.query.vgirpc.launcher.PosixLauncherSupport;
+import farm.query.vgirpc.marshal.RecordCodec;
 import farm.query.vgirpc.transport.RpcTransport;
 import farm.query.vgirpc.transport.SubprocessTransport;
 import farm.query.vgirpc.transport.TcpSocketTransport;
@@ -32,6 +36,7 @@ import java.util.ArrayList;
 import java.util.Deque;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Queue;
 import java.util.concurrent.CompletableFuture;
@@ -238,6 +243,68 @@ public final class VgiWorkerClient implements AutoCloseable {
         resolvedImplementationVersion = resolved;
         resolvedImplementationVersionCached = true;
         return resolved;
+    }
+
+    // Discovered once, lazily, catalog-wide — every schema's TABLE_FUNCTION
+    // FunctionInfo entries, keyed by lower-cased name. Ported from
+    // vgi-trino's VgiTableScanFunctions#discover (there, run eagerly at
+    // connector-factory time; here, lazily on first use — see this class's
+    // established declaredSettings/defaultSchema/resolvedDataVersion
+    // lazy-cache pattern above). Same accepted imprecision as that port: a
+    // function name reused across two schemas can only resolve to whichever
+    // SAME-NAMED sibling was discovered first, never a cross-worker/
+    // cross-tenant leak (both belong to this one attached worker).
+    private volatile Map<String, String> scanFunctionSchemas;
+
+    /**
+     * @param functionName a scan function's bare name — {@code
+     *        TableScanFunctionGetResponse.function_name()} or {@code
+     *        ScanBranchesDecoder.DecodedBranch#functionName()}
+     * @return the schema that function is declared in, from a one-time
+     *         catalog-wide {@code catalog_schema_contents_functions} sweep —
+     *         what {@link farm.query.vgispark.scan.VgiScan#planBranchPartitions}
+     *         needs for {@code BindRequest.schema_name}, since neither {@code
+     *         TableScanFunctionGetResponse} nor {@code ScanBranch} carries the
+     *         scan function's OWN schema (only the table's, which a
+     *         declarative table can legitimately differ from) — or {@code
+     *         null} if the sweep found no such name (a scan function the
+     *         worker deliberately hid from its own catalog listing; VGI's
+     *         dispatch rules accept a null {@code schema_name} for exactly
+     *         that case, resolving it by bare name instead)
+     */
+    public String scanFunctionSchema(String functionName) {
+        Map<String, String> cached = scanFunctionSchemas;
+        if (cached == null) {
+            cached = discoverScanFunctionSchemas();
+            scanFunctionSchemas = cached;
+        }
+        return cached.get(functionName.toLowerCase(Locale.ROOT));
+    }
+
+    private Map<String, String> discoverScanFunctionSchemas() {
+        return withConnection(a -> {
+            List<String> schemas = new ArrayList<>();
+            for (byte[] item : a.service().catalog_schemas(a.handle(), null).items()) {
+                schemas.add(RecordCodec.deserializeFromBytes(item, SchemaInfo.class).name());
+            }
+            Map<String, String> byName = new LinkedHashMap<>();
+            for (String schemaName : schemas) {
+                ItemsResponse functions = a.service().catalog_schema_contents_functions(
+                        a.handle(), schemaName, "TABLE_FUNCTION", null, null);
+                for (byte[] item : functions.items()) {
+                    FunctionInfo info = RecordCodec.deserializeFromBytes(item, FunctionInfo.class);
+                    // Only plain producer-mode TABLE functions — a
+                    // table_in_out/table_buffering function sharing the same
+                    // bare name (VgiTableProcedures#loadProcedure already
+                    // narrows the same "TABLE_FUNCTION" wire category the
+                    // same way) must never shadow the real scan function's
+                    // schema.
+                    if (!"TABLE".equals(info.function_type())) continue;
+                    byName.putIfAbsent(info.name().toLowerCase(Locale.ROOT), info.schema_name());
+                }
+            }
+            return Map.copyOf(byName);
+        });
     }
 
     /**

@@ -186,11 +186,17 @@ public final class VgiUnboundTableProcedure implements SimpleProcedure {
                 false,
                 null, null,     // at_unit / at_value — not applicable to a direct call
                 null, null,     // copy_from / copy_to
-                // NOT schemaName: mirrors VgiScan.planBranchPartitions's own
-                // choice (see its comment) — null lets the worker's dispatcher
-                // search every schema by name, rather than asserting this one
-                // specific schema.
-                null);
+                // schemaName IS known exactly here — this.schemaName is the
+                // schema this procedure was resolved from (VgiTableProcedures
+                // .loadProcedure already looked up info via that exact
+                // schema's catalog_schema_contents_functions). Unlike
+                // VgiScan.planBranchPartitions's scan-function bind (whose
+                // function can live in a DIFFERENT schema than the table
+                // being scanned), a CALL'd procedure's function and its
+                // resolved schema are the same lookup — no ambiguity to
+                // preserve by omitting it, and VGI protocol 1.1.0 requires a
+                // bind to name its owning schema.
+                schemaName);
         BindResponse bound = client.withConnection(a -> a.service().bind(
                 withAttachHandle(bindRequest, a.handle()), null));
 
