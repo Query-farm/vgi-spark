@@ -159,7 +159,9 @@ executor classpath. This isn't a guess: Gradle's own dependency resolution
 on this module's test classpath already upgrades both to Spark's versions,
 and this whole connector's test suite passes against those newer,
 Spark-provided versions on every run — proof they already satisfy whatever
-API surface `farm.query:vgi`/`farm.query:vgirpc` actually need.
+API surface `farm.query:vgi`/`farm.query:vgirpc` actually need — confirmed
+not just on the Gradle test classpath but in a real deployment too, see
+"Try it with Docker" below.
 
 ```bash
 ./gradlew :connector:assembleDeployDir
@@ -179,16 +181,42 @@ a task to — confirmed in source, not assumed) — the driver never proxies
 data through itself. That means the worker command must be spawnable, or
 the `unix://` socket path reachable, from **every executor node**, not
 just wherever the driver runs. This only matters once driver and executors
-are genuinely different machines (a real cluster — everything in this
-repo's own test suite runs `local[N]`/single-process, where the
-distinction doesn't exist). `tcp://`/`http(s)://` locations don't have
-this constraint, since those just need the worker reachable over the
-network from every node, not spawnable/co-located on each one.
+are genuinely different processes (this repo's own test suite runs
+`local[N]`/single-process, where the distinction doesn't exist — the
+Docker setup below is a real, separate-process deployment where it does).
+`tcp://`/`http(s)://` locations don't have this constraint, since those
+just need the worker reachable over the network from every node, not
+spawnable/co-located on each one.
 
 **Spark/Scala compatibility**: built and tested against exactly Spark
 `4.2.0` / Scala `2.13`. Other Spark 4.x point releases or Scala `2.12` are
 untested — nothing here is deliberately incompatible with them, but don't
 assume it works without checking.
+
+### Try it with Docker
+
+```bash
+./gradlew :connector:assembleDeployDir
+docker compose -f docker/docker-compose.yml up --build spark
+```
+
+Drops you into a `spark-shell` already attached to a real `vgi-rust`
+worker running in a separate container over `tcp://` — just run
+`spark.sql("SELECT * FROM vgi_example.data.numbers").show()`.
+
+For the real multi-process deployment shape (separate `spark-master`/
+`spark-worker` containers, a genuinely separate executor JVM process, not
+just `local[*]` inside one container):
+
+```bash
+docker compose -f docker/docker-compose.yml --profile spark-cluster up -d --build spark-master spark-worker
+docker compose -f docker/docker-compose.yml --profile spark-cluster run --rm spark-submit
+```
+
+See `docker/docker-compose.yml`'s own comments for what each piece does
+and why (including two real Docker-specific bugs found and fixed getting
+this working — the required Spark JVM flags, ported from `vgi-trino`'s own
+equivalent discovery, and a `PATH` gap for Spark's cluster launch scripts).
 
 ## Architecture
 

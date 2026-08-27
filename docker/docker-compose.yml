@@ -3,9 +3,8 @@
 # Worked example: Spark + this connector + the vgi-rust reference worker,
 # as separate containers — tcp:// is what crosses a container boundary
 # cleanly (a bare-command/unix:// location needs the worker spawnable/
-# reachable on every executor specifically, which is a real constraint
-# worth demonstrating with, not routing around — see the `spark-cluster`
-# profile below for that).
+# reachable on every executor specifically — see README.md's own
+# "Deploying it" section).
 #
 # Build and start (from the repo root):
 #   ./gradlew :connector:assembleDeployDir
@@ -18,6 +17,19 @@
 # own command below rather than a mounted properties file — spark-shell has
 # no config-file equivalent to Trino's catalog properties directory, these
 # are plain --conf flags spark-submit/spark-shell/pyspark all accept
+# identically.
+#
+# Verified end to end 2026-08-27: both the plain `spark` service (local[*]
+# inside one container) and the `spark-cluster` profile below (a REAL
+# Spark standalone cluster — separate spark-master/spark-worker containers,
+# the worker spawning a genuinely separate executor JVM child process, then
+# `spark-submit` targeting spark://spark-master:7077) return the correct
+# result for `SELECT count(*), sum(value) FROM vgi_example.data.numbers`
+# (100, 4950) against the tcp:// vgi-worker container. This is the real,
+# multi-process validation this repo's own CLAUDE.md documents an earlier
+# local-cluster[...] JVM-mode attempt failing at (an unrelated environment
+# issue, not a connector bug) — this Docker-based path succeeded where that
+# one didn't, and is the one to trust going forward.
 # identically.
 
 services:

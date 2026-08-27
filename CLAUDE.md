@@ -303,16 +303,29 @@ records pass (up from 711 before the NULL-argument fix) — up from a stale
 own "Deploying it" section — `connector:assembleDeployDir`, and the
 executor-reachability constraint for bare-command/`unix://`/`launch:`
 locations, confirmed in source, not assumed). Attempted an actual
-multi-process `local-cluster[...]` validation to verify that constraint and
-the Arrow/Netty exclusion end to end; abandoned it — `local-cluster` mode
-itself doesn't start cleanly in this environment even with zero custom
-config (`SparkContext` self-stops immediately, `IllegalStateException:
-Cannot call methods on a stopped SparkContext`), a separate, unrelated
-environment issue not worth chasing further right now. The Arrow/Netty
-exclusion is still evidence-based (Gradle's own test-classpath resolution
-already upgrades both, and the whole suite passes against those versions),
-just not verified via a genuinely separate-process executor the way the
-plan originally wanted.
+multi-process `local-cluster[...]` validation first; abandoned it —
+`local-cluster` mode itself doesn't start cleanly in this environment even
+with zero custom config (`SparkContext` self-stops immediately,
+`IllegalStateException: Cannot call methods on a stopped SparkContext`), a
+separate, unrelated environment issue. **Got the real validation a
+different way instead**: added `docker/` (Dockerfile, Dockerfile.worker,
+docker-compose.yml — a real Spark 4.2.0 image built from Apache's own
+tarball since no official `apache/spark:4.2.0` image exists, plus a
+`vgi-rust`-built worker image) and its `spark-cluster` compose profile — a
+genuine Spark standalone cluster (separate `spark-master`/`spark-worker`
+containers, the worker spawning an actual separate executor JVM child
+process). Verified end to end 2026-08-27: `spark-submit --master
+spark://spark-master:7077` against the `tcp://` `vgi-worker` container
+returns the correct result. This is the real multi-process proof the
+`local-cluster` attempt couldn't give — both the executor-reachability
+claim and the Arrow/Netty jar exclusion are now confirmed in a genuine
+separate-process deployment, not just Gradle's own test-classpath
+resolution. Two real Docker bugs found and fixed along the way (both
+explained in `docker/Dockerfile`'s/`docker-compose.yml`'s own comments):
+the two Spark JVM flags (`--add-opens`, `--enable-native-access`) `vgi-trino`'s
+own Dockerfile already discovered were needed, ported directly; and
+`start-master.sh`/`start-worker.sh` live in Spark's `sbin/`, not `bin/`,
+which wasn't on `PATH` at first.
 
 Work happened partly on a temporary EC2 instance (Amazon Linux 2023,
 aarch64/Graviton, Corretto 21) rather than the maintainer's own machine,
