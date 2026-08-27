@@ -142,6 +142,46 @@ public record VgiCatalogConfig(
         String implementationVersion,
         Map<String, String> attachOptions) implements java.io.Serializable {
 
+    /**
+     * Redacts {@link #httpBearerToken} and every {@link #attachOptions}
+     * VALUE (a custom ATTACH option can legitimately carry a secret — e.g.
+     * an {@code api_key}, see {@code VgiCustomAttachOptionsTest}'s own
+     * fixture) — a plain record's generated {@code toString()} would print
+     * both in full. Nothing in this connector's own code concatenates or
+     * logs a whole {@code VgiCatalogConfig} (checked), but {@link VgiTable}/
+     * {@link farm.query.vgispark.scan.VgiScan} are records that embed one,
+     * and Spark's own internals (query-plan {@code explain()}, an exception
+     * message, the Spark UI) could plausibly call {@code toString()} on
+     * those without this connector ever being consulted — this override is
+     * the one place that closes the leak regardless of where a print
+     * ultimately comes from.
+     */
+    @Override
+    public String toString() {
+        return "VgiCatalogConfig[location=" + location
+                + ", catalogName=" + catalogName
+                + ", connections=" + connections
+                + ", targetSplitBytes=" + targetSplitBytes
+                + ", minSplits=" + minSplits
+                + ", maxSplitsPerResponse=" + maxSplitsPerResponse
+                + ", connectionAcquireTimeoutMillis=" + connectionAcquireTimeoutMillis
+                + ", maxPlanPages=" + maxPlanPages
+                + ", httpBearerToken=" + (httpBearerToken == null ? "null" : "<redacted>")
+                + ", launcherEnabled=" + launcherEnabled
+                + ", launcherIdleTimeoutSeconds=" + launcherIdleTimeoutSeconds
+                + ", launcherStateDir=" + launcherStateDir
+                + ", dataVersionSpec=" + dataVersionSpec
+                + ", implementationVersion=" + implementationVersion
+                + ", attachOptions=" + redactedAttachOptions()
+                + "]";
+    }
+
+    private Map<String, String> redactedAttachOptions() {
+        Map<String, String> redacted = new java.util.LinkedHashMap<>();
+        for (String key : attachOptions.keySet()) redacted.put(key, "<redacted>");
+        return redacted;
+    }
+
     /** Default connection-pool size when {@code connections} is unset. */
     public static final int DEFAULT_CONNECTIONS = 4;
 
