@@ -263,6 +263,49 @@ bounded retry with a genuinely fresh connection failed identically —
 tried and reverted, see git history), and a worker crash (checked its
 stderr directly, twice, clean both times).
 
+## Fixed: `assembleDeployDir` silently omitted every dependency jar (2026-08-27)
+
+The new CI `docker` job (added to actually build/run the Docker setup on
+every push, after it was found to have zero other CI coverage) failed on
+its very first real run — a `count`/`sum` query threw
+`NoClassDefFoundError: farm/query/vgirpc/MethodNotImplementedError` inside
+the deployed image, even though the same image had been manually verified
+working days earlier. Root cause, confirmed by reproducing locally with a
+truly clean `build/` (see git history for the exact repro): `from({ ... })`
+in `connector/build.gradle.kts`'s `assembleDeployDir` task — a raw Kotlin
+lambda — is **not** one of the source types Gradle's `CopySpec` resolution
+recognizes (`Closure`, `Callable`, `Provider`, `FileCollection`, `Task`,
+...; a bare Kotlin `Function0` isn't `java.util.concurrent.Callable`), so
+Gradle silently treated it as contributing **zero files** — no error, no
+warning. Every dependency jar (`vgi`, `vgirpc`, Jackson, Jetty, ...) was
+missing from every deploy dir this task ever produced; only the
+connector's own jar (wired separately via `from(tasks.named("jar"))`, a
+real `Provider`) ever actually landed. This went completely unnoticed
+through every manual EC2 verification because `Copy` never cleans stale
+outputs it didn't itself produce — a `build/deploy/` directory left over
+from an earlier, correctly-configured invocation (or one built before this
+regression) just sat there looking populated on every subsequent run. The
+smoke test's simple `SELECT *` queries also happened not to exercise the
+one code path (`VgiCatalog`'s multi-branch fallback, `catch
+(MethodNotImplementedError ...)`) that needed a class only present in the
+silently-dropped `vgirpc` jar — the aggregate `count`/`sum` query the CI
+`docker` job added specifically to be a more thorough smoke test did,
+which is exactly why it caught this and nothing before it did.
+
+Fixed two ways in the same task: `project.provider { ... }` (a real,
+Gradle-recognized lazy source) instead of the raw lambda, plus an explicit
+`dependsOn(configurations.runtimeClasspath)` — `Configuration` is
+`Buildable`, so this forces every task that produces the configuration's
+artifacts (including the vgi-java/vgi-rpc-java composite builds' own `:vgi`/
+`:vgirpc` `jar` tasks) to actually run first; resolving `.resolvedArtifacts`
+alone, inside a lambda Gradle never calls, established no such ordering.
+Also added `doFirst { delete(...) }` so the task always starts from a clean
+directory — the exact staleness that hid this bug for as long as it did.
+Verified by reproducing the bug locally with `rm -rf build/`, confirming the
+fix populates every expected jar (including Arrow/Netty staying correctly
+excluded) on a clean build, then re-running the full Docker smoke test
+locally end to end (`100 | 4950`, same as the original manual verification).
+
 ## Open bugs (not yet fixed)
 
 - **`opt_time` / Arrow `Time(MICROSECOND)` has no Spark mapping.**

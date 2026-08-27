@@ -38,6 +38,14 @@ follows [Semantic Versioning](https://semver.org/).
   but `VgiTable`/`VgiScan` are records that embed one, and Spark's own
   internals (`explain()`, an exception message, the UI) could plausibly
   call `toString()` on those without this connector being consulted.
+- `connector:assembleDeployDir` silently produced a deploy dir containing
+  **only** the connector's own jar — every dependency jar (`vgi`, `vgirpc`,
+  Jackson, Jetty, ...) was missing, with no error. Caught by the new CI
+  `docker` job's aggregate-query smoke test (a real, previously-untested
+  code path), not by the manual verification above, which had been reusing
+  a stale, already-populated `build/deploy/` directory the whole time. See
+  `CLAUDE.md`'s own writeup for the full root cause (a raw Kotlin lambda
+  Gradle's `CopySpec` silently doesn't resolve) and fix.
 
 [0.3.0]: https://github.com/Query-farm/vgi-spark/releases/tag/v0.3.0
 

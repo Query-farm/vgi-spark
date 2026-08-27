@@ -83,17 +83,42 @@ val assembleDeployDir by tasks.registering(Copy::class) {
             "non-Netty runtime dependencies into build/deploy/, ready for spark-submit --jars " +
             "(Arrow/Netty are excluded -- see this task's own comment)."
     from(tasks.named("jar"))
-    // Lambda, not an eagerly-evaluated list: dependency resolution must
-    // happen at task-execution time, not project-configuration time, or it
-    // conflicts with the vgi-java/vgi-rpc-java composite builds' own
-    // configuration-time lifecycle ("Project#beforeEvaluate(Action) cannot
-    // be executed in the current context").
-    from({
+    // A real, previously-undiscovered bug lived here: a raw Kotlin lambda
+    // (`from({ ... })`) is NOT one of the source types Gradle's CopySpec
+    // resolution recognizes (Closure, Callable, Provider, FileCollection,
+    // Task, ...) -- a bare Kotlin `Function0` isn't `java.util.concurrent
+    // .Callable`, so Gradle silently treated it as contributing ZERO files,
+    // no error. Every dependency jar (vgi, vgirpc, jackson, jetty, ...) was
+    // missing from every deploy dir this task ever produced; only the
+    // connector's own jar (wired above via `tasks.named("jar")`, a real
+    // Provider) actually landed. This went unnoticed because a *stale*
+    // build/deploy/ directory from an earlier invocation (with different
+    // composite-build inputs) still had old copies of those jars sitting
+    // in it from a previous run -- `Copy` never cleans stale outputs it
+    // didn't itself produce this time, so it looked populated. Caught by
+    // the CI `docker` job's smoke test (a real query against a genuinely
+    // fresh image), NOT by any earlier manual verification, which reused a
+    // dev machine's already-populated build/deploy/ dir throughout. Fixed
+    // two ways: `project.provider { ... }` IS a Gradle-recognized lazy
+    // source (unlike a bare lambda), and `dependsOn(configurations
+    // .runtimeClasspath)` explicitly forces every task that produces this
+    // configuration's artifacts -- including the vgi-java/vgi-rpc-java
+    // composite builds' own :vgi/:vgirpc `jar` tasks -- to run first
+    // (Configuration is Buildable; resolving `.resolvedArtifacts` alone,
+    // inside a lambda Gradle never actually calls, does NOT establish that
+    // ordering on its own).
+    dependsOn(configurations.runtimeClasspath)
+    from(project.provider {
         configurations.runtimeClasspath.get().resolvedConfiguration.resolvedArtifacts
             .filter { it.moduleVersion.id.group !in deployExcludedGroups }
             .map { it.file }
     })
     into(layout.buildDirectory.dir("deploy"))
+    // Stale outputs (e.g. an old connector-0.2.0.jar sitting next to a
+    // fresh connector-0.3.0.jar after a version bump) are exactly what let
+    // the bug above hide -- start every run from a clean directory instead
+    // of merging into whatever a previous run left behind.
+    doFirst { delete(layout.buildDirectory.dir("deploy")) }
 }
 tasks.named("assemble") { dependsOn(assembleDeployDir) }
 
