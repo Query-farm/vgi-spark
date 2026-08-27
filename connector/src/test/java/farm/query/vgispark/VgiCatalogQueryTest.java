@@ -437,15 +437,20 @@ class VgiCatalogQueryTest {
                 "expected a present row-count estimate for cardinality_inlined_table");
         assertEquals(10000L, cardinalityStats.numRows().getAsLong());
 
-        // numbers: no cardinality_estimate declared at all (only column
-        // statistics) — must report UNKNOWN (empty), not 0 or a fabricated
-        // guess, exactly the "may be null" case VgiTable.cardinalityEstimate()
-        // itself documents.
-        Table numbersTable = catalog.loadTable(Identifier.of(new String[] {"data"}, "numbers"));
-        ScanBuilder numbersBuilder = ((SupportsRead) numbersTable).newScanBuilder(CaseInsensitiveStringMap.empty());
-        VgiScan numbersScan = (VgiScan) numbersBuilder.build();
-        Statistics numbersStats = numbersScan.estimateStatistics();
-        assertFalse(numbersStats.numRows().isPresent(),
+        // ten_thousand_table: no cardinality_estimate declared at all (only
+        // column statistics) — must report UNKNOWN (empty), not 0 or a
+        // fabricated guess, exactly the "may be null" case VgiTable
+        // .cardinalityEstimate() itself documents. NOT "numbers" (this
+        // test's original target): the vgi-rust fixture's own data.numbers
+        // (vgi-example-worker/src/catalog_def.rs) declares a real
+        // cardinality_estimate of 100 — a genuine difference from the
+        // now-retired Python fixture this test was originally written
+        // against, not a connector bug.
+        Table noCardTable = catalog.loadTable(Identifier.of(new String[] {"data"}, "ten_thousand_table"));
+        ScanBuilder noCardBuilder = ((SupportsRead) noCardTable).newScanBuilder(CaseInsensitiveStringMap.empty());
+        VgiScan noCardScan = (VgiScan) noCardBuilder.build();
+        Statistics noCardStats = noCardScan.estimateStatistics();
+        assertFalse(noCardStats.numRows().isPresent(),
                 "expected UNKNOWN (no cardinality_estimate declared), not a fabricated row count");
     }
 
