@@ -197,6 +197,15 @@ final class VgiUnboundScalarFunction implements UnboundFunction {
         Schema rowInputSchema = new Schema(rowFields);
         byte[] rowInputSchemaBytes = ArrowSchemaCodec.serializeSchema(rowInputSchema);
         Field[] resolvedFieldsArray = resolvedFields.toArray(new Field[0]);
+        // "SPECIAL" opts a function IN to receiving a null argument (and
+        // possibly returning a meaningful non-null answer for one); anything
+        // else — including the field being absent — is DuckDB's DEFAULT
+        // convention: short-circuit to a null result for ANY null argument,
+        // without ever calling the function. See VgiScalarFunction
+        // .produceResult's own comment for the full story (including why
+        // this exists at all — it's not optional, a strict-typed worker
+        // rejects an actual null sent through for a DEFAULT-handling arg).
+        boolean shortCircuitOnNull = !"SPECIAL".equalsIgnoreCase(info.null_handling());
 
         if (!hasConstArgs) {
             // No vgi_const arguments: unchanged from before this class
@@ -222,7 +231,8 @@ final class VgiUnboundScalarFunction implements UnboundFunction {
             byte[] outputSchemaBytes = boundHolder[0].output_schema();
             DataType returnType = resolveReturnType(outputSchemaBytes);
             return VgiScalarFunction.eager(config, info.name(), bindCallBytes, outputSchemaBytes, opaqueData,
-                    rowInputSchemaBytes, resolvedInputTypes, rowArgIndices, returnType, deterministic);
+                    rowInputSchemaBytes, resolvedInputTypes, rowArgIndices, returnType, deterministic,
+                    shortCircuitOnNull);
         }
 
         // At least one vgi_const argument: its VALUE (not just type) is only
@@ -235,7 +245,7 @@ final class VgiUnboundScalarFunction implements UnboundFunction {
         // site, unlike Trino's shared-across-Drivers cache).
         DataType returnType = resolveStaticReturnType(context);
         return VgiScalarFunction.lazyConst(config, schemaName, info.name(), resolvedInputTypes, resolvedFieldsArray,
-                rowArgIndices, constArgIndices, rowInputSchemaBytes, returnType, deterministic);
+                rowArgIndices, constArgIndices, rowInputSchemaBytes, returnType, deterministic, shortCircuitOnNull);
     }
 
     /**

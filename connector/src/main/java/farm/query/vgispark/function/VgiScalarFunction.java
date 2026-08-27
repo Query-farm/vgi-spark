@@ -98,6 +98,7 @@ final class VgiScalarFunction implements ScalarFunction<Object> {
     private final Field[] resolvedFields;         // full, all signature positions; only read for const args
     private final DataType returnType;
     private final boolean deterministic;
+    private final boolean shortCircuitOnNull;
 
     private transient VgiWorkerClient.Attached connection;
     private transient Schema rowInputSchema;
@@ -113,7 +114,7 @@ final class VgiScalarFunction implements ScalarFunction<Object> {
     private VgiScalarFunction(VgiCatalogConfig config, String schemaName, String functionName,
             byte[] driverBindCallBytes, byte[] driverOutputSchemaBytes, byte[] driverOpaqueData,
             byte[] rowInputSchemaBytes, DataType[] inputTypes, int[] rowArgIndices, int[] constArgIndices,
-            Field[] resolvedFields, DataType returnType, boolean deterministic) {
+            Field[] resolvedFields, DataType returnType, boolean deterministic, boolean shortCircuitOnNull) {
         this.config = config;
         this.schemaName = schemaName;
         this.functionName = functionName;
@@ -127,23 +128,25 @@ final class VgiScalarFunction implements ScalarFunction<Object> {
         this.resolvedFields = resolvedFields;
         this.returnType = returnType;
         this.deterministic = deterministic;
+        this.shortCircuitOnNull = shortCircuitOnNull;
     }
 
     /** No {@code vgi_const} arguments — already bound once, on the driver. */
     static VgiScalarFunction eager(VgiCatalogConfig config, String functionName, byte[] bindCallBytes,
             byte[] outputSchemaBytes, byte[] opaqueData, byte[] rowInputSchemaBytes, DataType[] inputTypes,
-            int[] rowArgIndices, DataType returnType, boolean deterministic) {
+            int[] rowArgIndices, DataType returnType, boolean deterministic, boolean shortCircuitOnNull) {
         return new VgiScalarFunction(config, null, functionName, bindCallBytes, outputSchemaBytes, opaqueData,
-                rowInputSchemaBytes, inputTypes, rowArgIndices, new int[0], null, returnType, deterministic);
+                rowInputSchemaBytes, inputTypes, rowArgIndices, new int[0], null, returnType, deterministic,
+                shortCircuitOnNull);
     }
 
     /** At least one {@code vgi_const} argument — bound lazily, per observed value, in {@link #produceResult}. */
     static VgiScalarFunction lazyConst(VgiCatalogConfig config, String schemaName, String functionName,
             DataType[] inputTypes, Field[] resolvedFields, int[] rowArgIndices, int[] constArgIndices,
-            byte[] rowInputSchemaBytes, DataType returnType, boolean deterministic) {
+            byte[] rowInputSchemaBytes, DataType returnType, boolean deterministic, boolean shortCircuitOnNull) {
         return new VgiScalarFunction(config, schemaName, functionName, null, null, null,
                 rowInputSchemaBytes, inputTypes, rowArgIndices, constArgIndices, resolvedFields, returnType,
-                deterministic);
+                deterministic, shortCircuitOnNull);
     }
 
     @Override
@@ -168,6 +171,31 @@ final class VgiScalarFunction implements ScalarFunction<Object> {
 
     @Override
     public Object produceResult(InternalRow input) {
+        // DuckDB's own query engine short-circuits a DEFAULT-null-handling
+        // function to NULL, for ANY null argument, without ever invoking the
+        // function at all (a declarative "STRICT SQL function" contract —
+        // FunctionInfo.null_handling's whole reason for existing, "SPECIAL"
+        // opting a function OUT of it). Spark's ScalarFunction<T> API has no
+        // such declarative contract of its own — produceResult is always
+        // called regardless of null arguments — so this connector has to
+        // implement the short-circuit itself. Root-caused via direct worker
+        // instrumentation (not a Spark/connection-reuse issue — ruled out
+        // separately): sending an actual null through for a DEFAULT-handling
+        // argument, which the worker declares non-nullable on the wire, hits
+        // an Arrow schema-validation error server-side ("Column 'value' is
+        // declared as non-nullable but contains null values") that vgi-rpc's
+        // own lockstep loop then swallows into a bare, uninformative stream
+        // close instead of an error frame — surfacing here as
+        // NoSuchElementException with no explanation at all. Skipping the
+        // call entirely for a SPECIAL-handling function would be wrong: it
+        // deliberately doesn't have this contract, and may return a
+        // meaningful non-null answer for otherwise-null input — the whole
+        // reason "SPECIAL" exists.
+        if (shortCircuitOnNull) {
+            for (int i = 0; i < input.numFields(); i++) {
+                if (input.isNullAt(i)) return null;
+            }
+        }
         ensureConnection();
         try {
             byte[] bindCallBytes;
