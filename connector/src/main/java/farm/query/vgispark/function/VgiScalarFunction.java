@@ -168,66 +168,90 @@ final class VgiScalarFunction implements ScalarFunction<Object> {
 
     @Override
     public Object produceResult(InternalRow input) {
-        ensureConnection();
-        try {
-            byte[] bindCallBytes;
-            byte[] outputSchemaBytes;
-            byte[] opaqueData;
-            if (constArgIndices.length == 0) {
-                bindCallBytes = driverBindCallBytes;
-                outputSchemaBytes = driverOutputSchemaBytes;
-                opaqueData = driverOpaqueData;
-            } else {
-                Object[] observed = new Object[constArgIndices.length];
-                for (int i = 0; i < constArgIndices.length; i++) {
-                    int sigIndex = constArgIndices[i];
-                    observed[i] = VgiScalarValueBridge.readPlainValue(input, sigIndex, inputTypes[sigIndex]);
+        // One bounded retry, not zero: this same connection is reused across
+        // every produceResult call this bound function's whole lifetime makes
+        // (see ensureConnection's own javadoc) — deliberately, to avoid a
+        // fresh connection per scalar-UDF row during normal task execution.
+        // Spark's own ConstantFolding optimizer rule evaluates an all-literal
+        // expression via repeated produceResult calls on that ONE instance —
+        // confirmed empirically (a per-call identity-hashed log during
+        // diagnosis showed the SAME instance called three times in a row for
+        // a single constant SELECT) — and after enough back-to-back init()
+        // exchanges on the same connection without an intervening real batch
+        // read in between, the wire desyncs: NoSuchElementException from
+        // ClientStreamSession, with no error and no crash on the worker side
+        // (confirmed by inspecting its stderr directly), i.e. a framing bug
+        // in reusing one connection for rapid repeated exchanges — likely in
+        // vgi-rpc-java's own stream-close/drain sequencing, not this class.
+        // A real fix belongs there; this retry is the same self-healing
+        // philosophy VgiWorkerClient.release already applies to its pool
+        // (discard a connection left in an indeterminate state, don't trust
+        // it again) — a fresh connection has no accumulated wire state and
+        // reliably succeeds.
+        RuntimeException lastFailure = null;
+        for (int attempt = 0; attempt < 2; attempt++) {
+            ensureConnection();
+            try {
+                byte[] bindCallBytes;
+                byte[] outputSchemaBytes;
+                byte[] opaqueData;
+                if (constArgIndices.length == 0) {
+                    bindCallBytes = driverBindCallBytes;
+                    outputSchemaBytes = driverOutputSchemaBytes;
+                    opaqueData = driverOpaqueData;
+                } else {
+                    Object[] observed = new Object[constArgIndices.length];
+                    for (int i = 0; i < constArgIndices.length; i++) {
+                        int sigIndex = constArgIndices[i];
+                        observed[i] = VgiScalarValueBridge.readPlainValue(input, sigIndex, inputTypes[sigIndex]);
+                    }
+                    if (cachedConstValues == null || !Arrays.equals(observed, cachedConstValues)) {
+                        rebindWithConstValues(observed);
+                    }
+                    bindCallBytes = cachedBindCallBytes;
+                    outputSchemaBytes = cachedOutputSchemaBytes;
+                    opaqueData = cachedOpaqueData;
                 }
-                if (cachedConstValues == null || !Arrays.equals(observed, cachedConstValues)) {
-                    rebindWithConstValues(observed);
-                }
-                bindCallBytes = cachedBindCallBytes;
-                outputSchemaBytes = cachedOutputSchemaBytes;
-                opaqueData = cachedOpaqueData;
-            }
 
-            try (VectorSchemaRoot root = VectorSchemaRoot.create(rowInputSchema(), Allocators.root())) {
-                root.allocateNew();
-                for (int rowPos = 0; rowPos < rowArgIndices.length; rowPos++) {
-                    int sigIndex = rowArgIndices[rowPos];
-                    VgiScalarValueBridge.writeAt(root.getVector(rowPos), inputTypes[sigIndex], input, sigIndex, 0);
-                }
-                for (FieldVector v : root.getFieldVectors()) v.setValueCount(1);
-                root.setRowCount(1);
+                try (VectorSchemaRoot root = VectorSchemaRoot.create(rowInputSchema(), Allocators.root())) {
+                    root.allocateNew();
+                    for (int rowPos = 0; rowPos < rowArgIndices.length; rowPos++) {
+                        int sigIndex = rowArgIndices[rowPos];
+                        VgiScalarValueBridge.writeAt(root.getVector(rowPos), inputTypes[sigIndex], input, sigIndex, 0);
+                    }
+                    for (FieldVector v : root.getFieldVectors()) v.setValueCount(1);
+                    root.setRowCount(1);
 
-                InitRequest initRequest = new InitRequest(
-                        bindCallBytes, outputSchemaBytes, opaqueData,
-                        null, null, null, null, null, null,
-                        null, null, null, null,
-                        null, null,
-                        null, null, null, null);
-                RpcStream<? extends StreamState> stream = connection.service().init(initRequest, null);
-                ClientStreamSession<?> session = (ClientStreamSession<?>) stream;
-                AnnotatedBatch out = session.exchange(new AnnotatedBatch(root, null));
-                try {
-                    // Every VGI scalar function's output schema has exactly one column, named "result".
-                    FieldVector resultVector = out.root().getVector("result");
-                    return VgiScalarValueBridge.read(resultVector, returnType, 0);
-                } finally {
-                    session.close();
+                    InitRequest initRequest = new InitRequest(
+                            bindCallBytes, outputSchemaBytes, opaqueData,
+                            null, null, null, null, null, null,
+                            null, null, null, null,
+                            null, null,
+                            null, null, null, null);
+                    RpcStream<? extends StreamState> stream = connection.service().init(initRequest, null);
+                    ClientStreamSession<?> session = (ClientStreamSession<?>) stream;
+                    AnnotatedBatch out = session.exchange(new AnnotatedBatch(root, null));
+                    try {
+                        // Every VGI scalar function's output schema has exactly one column, named "result".
+                        FieldVector resultVector = out.root().getVector("result");
+                        return VgiScalarValueBridge.read(resultVector, returnType, 0);
+                    } finally {
+                        session.close();
+                    }
                 }
+            } catch (RuntimeException e) {
+                // The connection may be left in an indeterminate wire state after
+                // a failed call (same lockstep-framing reasoning as
+                // VgiWorkerClient.release) — don't reuse it, or any bind cached
+                // against it, for a later row (or the retry below).
+                closeConnectionQuietly();
+                connection = null;
+                cachedBindCallBytes = null;
+                cachedConstValues = null;
+                lastFailure = e;
             }
-        } catch (RuntimeException e) {
-            // The connection may be left in an indeterminate wire state after
-            // a failed call (same lockstep-framing reasoning as
-            // VgiWorkerClient.release) — don't reuse it, or any bind cached
-            // against it, for a later row.
-            closeConnectionQuietly();
-            connection = null;
-            cachedBindCallBytes = null;
-            cachedConstValues = null;
-            throw e;
         }
+        throw lastFailure;
     }
 
     /**
