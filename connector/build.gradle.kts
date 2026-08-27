@@ -57,4 +57,17 @@ dependencies {
 // socket/thread accumulation across many such classes in one JVM).
 tasks.test {
     forkEvery = 1
+    // Run those per-class forks CONCURRENTLY instead of one at a time — each
+    // fork is a fully separate JVM/process (its own SparkSession, its own
+    // worker subprocess, its own temp unix socket), so there's no shared
+    // mutable state between them to race on; the only real constraints are
+    // host RAM/CPU. Left at Gradle's own default (1) this connector's test
+    // suite ran every class strictly sequentially regardless of how many
+    // cores the host actually has — the sweep's own internal FILE_PARALLELISM
+    // thread pool was the only thing that ever used more than one core at a
+    // time. Divide by 4, not 2: several classes each burst wide on their own
+    // (the sweep especially, up to 32 threads) once running, so the fork
+    // COUNT needs headroom below the raw core count rather than assuming
+    // every fork stays single-threaded.
+    maxParallelForks = (Runtime.getRuntime().availableProcessors() / 4).coerceAtLeast(1)
 }
