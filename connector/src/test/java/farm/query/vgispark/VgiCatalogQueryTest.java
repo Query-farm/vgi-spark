@@ -19,6 +19,8 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.parallel.Execution;
+import org.junit.jupiter.api.parallel.ExecutionMode;
 
 import java.io.File;
 import java.util.List;
@@ -45,10 +47,27 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * in place of a {@code DistributedQueryRunner}.
  */
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
+// This class's ~39 @Test methods each only READ against the ONE shared,
+// already-attached, read-only SparkSession/worker start() builds below (no
+// DDL/DML anywhere in the class — grepped) and every method's own state is
+// local to itself. JUnit 5's default sequential-methods mode left ~39
+// independent Spark+RPC round trips serialized behind a single thread even
+// though Gradle already isolates this class into its own forked JVM —
+// @Execution flips just THIS class's methods to run concurrently
+// (junit-platform.properties keeps every other class at the default
+// same_thread mode). Same reasoning as VgiSqlLogicTestConformanceTest's
+// identical annotation.
+@Execution(ExecutionMode.CONCURRENT)
 class VgiCatalogQueryTest {
 
     private static final File VGI_RUST = new File(System.getProperty("user.home"), "Development/vgi-rust");
     private static final String CATALOG = "vgi_example";
+    // Matches the pool/executor width to the method-level concurrency
+    // @Execution(CONCURRENT) above introduces — same rationale as
+    // VgiSqlLogicTestSweepTest's own FILE_PARALLELISM/VgiSqlLogicTestConformanceTest's
+    // own METHOD_PARALLELISM.
+    private static final int METHOD_PARALLELISM =
+            Math.max(2, Math.min(16, Runtime.getRuntime().availableProcessors()));
 
     private VgiWorkerHarness.Handle worker;
     private SparkSession spark;
@@ -62,12 +81,15 @@ class VgiCatalogQueryTest {
         worker = VgiWorkerHarness.unix(VGI_RUST);
 
         spark = SparkSession.builder()
-                .master("local[2]")
+                // local[2] -> local[METHOD_PARALLELISM] — see @Execution
+                // (CONCURRENT)'s own comment above on this class.
+                .master("local[" + METHOD_PARALLELISM + "]")
                 .appName("vgi-spark-catalog-query-test")
                 .config("spark.ui.enabled", "false")
                 .config("spark.sql.catalog." + CATALOG, VgiCatalog.class.getName())
                 .config("spark.sql.catalog." + CATALOG + ".location", worker.location())
                 .config("spark.sql.catalog." + CATALOG + ".catalog-name", "example")
+                .config("spark.sql.catalog." + CATALOG + ".connections", String.valueOf(METHOD_PARALLELISM))
                 .getOrCreate();
     }
 
