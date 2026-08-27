@@ -64,7 +64,6 @@ subprojects {
             "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED",
             "--enable-native-access=ALL-UNNAMED",
         )
-        systemProperty("arrow.memory.debug.allocator", "true")
         maxHeapSize = "2g"
     }
 }
