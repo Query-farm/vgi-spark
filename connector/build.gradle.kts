@@ -50,6 +50,53 @@ dependencies {
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 }
 
+// This module's own jar carries only its own compiled classes — no
+// shadow/shade plugin, matching vgi-trino's own choice not to fat-jar
+// either. An operator (or spark-submit --jars/--packages) needs this jar
+// PLUS every runtime dependency it doesn't already get from Spark's own
+// classpath. Mirrors vgi-trino's own assemblePluginDir Copy task (that one
+// flattens into the directory-of-jars shape Trino's plugin loader
+// specifically needs; this one just flattens into a plain directory
+// spark-submit --jars can point at directly).
+//
+// org.apache.arrow/io.netty are EXCLUDED from the copy even though they're
+// on runtimeClasspath (farm.query:vgi pulls arrow-vector 18.1.0 and
+// io.netty transitively via farm.query:vgirpc) — Spark 4.2.0 itself
+// bundles newer versions of both (Arrow 19.0.0, Netty 4.2.13.Final; see
+// this file's own top comment), and shipping vgi's older copies via
+// --jars would put two conflicting majors on the same executor classpath —
+// the same category of conflict root build.gradle.kts's own comment
+// documents hitting at BUILD-toolchain time (JDK 25 + Spark's networking
+// vs. arrow-memory-netty), just at DEPLOYMENT-classpath time instead.
+// Confirmed safe to exclude, not just assumed: Gradle's own dependency
+// resolution on this module's test classpath already upgrades both
+// (`arrow-vector:18.1.0 -> 19.0.0`, `netty-{buffer,common}:4.2.9.Final ->
+// 4.2.13.Final` — run `./gradlew :connector:dependencies --configuration
+// testRuntimeClasspath` to see it), and vgi-java/vgi-rpc-java's own code
+// runs this whole connector's entire test suite successfully against
+// those newer, Spark-provided versions every time — proof the newer
+// versions already satisfy whatever API surface vgi's own code needs.
+val deployExcludedGroups = setOf("org.apache.arrow", "io.netty")
+val assembleDeployDir by tasks.registering(Copy::class) {
+    group = "distribution"
+    description = "Assemble this connector's own jar plus its non-Spark, non-Arrow, " +
+            "non-Netty runtime dependencies into build/deploy/, ready for spark-submit --jars " +
+            "(Arrow/Netty are excluded -- see this task's own comment)."
+    from(tasks.named("jar"))
+    // Lambda, not an eagerly-evaluated list: dependency resolution must
+    // happen at task-execution time, not project-configuration time, or it
+    // conflicts with the vgi-java/vgi-rpc-java composite builds' own
+    // configuration-time lifecycle ("Project#beforeEvaluate(Action) cannot
+    // be executed in the current context").
+    from({
+        configurations.runtimeClasspath.get().resolvedConfiguration.resolvedArtifacts
+            .filter { it.moduleVersion.id.group !in deployExcludedGroups }
+            .map { it.file }
+    })
+    into(layout.buildDirectory.dir("deploy"))
+}
+tasks.named("assemble") { dependsOn(assembleDeployDir) }
+
 // Fresh JVM per test class: several test classes each open a real pooled
 // connection to a real subprocess/socket worker via VgiWorkerClient's own
 // cached thread pool, and a local SparkSession also spins up its own thread
