@@ -77,7 +77,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class VgiSqlLogicTestSweepTest {
 
-    private static final File VGI_PYTHON = new File(System.getProperty("user.home"), "Development/vgi-python");
+    private static final File VGI_RUST = new File(System.getProperty("user.home"), "Development/vgi-rust");
     private static final File VGI_TEST_ROOT =
             new File(System.getProperty("user.home"), "Development/vgi/test/sql/integration");
     private static final String SPARK_CATALOG = "vgi_example";
@@ -86,10 +86,11 @@ class VgiSqlLogicTestSweepTest {
     // How many files run concurrently. Each file's own records still run one
     // at a time (runFile is a plain sequential loop) — this is file-level
     // parallelism only. Bounded, not "as many as files": the worker is a
-    // single Python process serving connections on its own daemon threads
-    // (GIL-bound for CPU work), so unlimited concurrency wouldn't keep
-    // scaling, just add contention. Matches FILE_PARALLELISM to the driver
-    // pool size below and to a plausible dev-machine core count.
+    // single vgi-example-worker process serving connections on its own
+    // threads, so unlimited concurrency wouldn't keep scaling this driver
+    // machine's own resources indefinitely, just add contention. Matches
+    // FILE_PARALLELISM to the driver pool size below and to a plausible
+    // dev-machine core count.
     private static final int FILE_PARALLELISM = 8;
 
     private VgiWorkerHarness.Handle worker;
@@ -97,26 +98,29 @@ class VgiSqlLogicTestSweepTest {
 
     @BeforeAll
     void start() throws Exception {
-        Assumptions.assumeTrue(VGI_PYTHON.isDirectory(),
-                "~/Development/vgi-python not present — skipping sqllogictest sweep");
+        Assumptions.assumeTrue(VGI_RUST.isDirectory(),
+                "~/Development/vgi-rust not present — skipping sqllogictest sweep");
         Assumptions.assumeTrue(VGI_TEST_ROOT.isDirectory(),
                 "~/Development/vgi/test/sql/integration not present — skipping sqllogictest sweep");
         // unix(), not subprocess(): a bare-command location makes VgiWorkerClient
-        // fork a FRESH "uv run ... vgi-fixture-worker" subprocess for every
-        // pooled connection AND every per-task connection VgiPartitionReader
-        // opens (see that class's own javadoc — executors don't share the
-        // driver's pool) — with ~2900 records across 191 files, that's
-        // thousands of subprocess spawns and was the dominant cost of this
-        // sweep. unix() starts ONE real worker process up front and hands out
-        // a unix:// socket location instead, so every one of those "new
+        // fork a FRESH worker subprocess for every pooled connection AND every
+        // per-task connection VgiPartitionReader opens (see that class's own
+        // javadoc — executors don't share the driver's pool) — with ~2900
+        // records across 191 files, that's thousands of subprocess spawns.
+        // unix() starts ONE real worker process up front and hands out a
+        // unix:// socket location instead, so every one of those "new
         // connection" calls becomes a cheap socket connect to an
         // already-running, already-warm worker (the reference worker's own
         // --unix mode defaults to --threaded, i.e. built to serve many
         // concurrent connections — this is exactly the "pool of one warm
         // worker" shape the VGI protocol's own launch: scheme formalizes,
         // see docs/ROADMAP.md tier 3, just without that scheme's cross-process
-        // sharing).
-        worker = VgiWorkerHarness.unix(VGI_PYTHON);
+        // sharing). See VgiWorkerHarness's own javadoc for the SEPARATE,
+        // larger win this sweep gets from vgi-rust's compiled binary over
+        // vgi-python's uv-run-launched interpreter: the per-process startup
+        // cost this ONE worker pays once, up front, before any of the ~2900
+        // records run.
+        worker = VgiWorkerHarness.unix(VGI_RUST);
 
         spark = SparkSession.builder()
                 // local[8], not local[2]: sweepTheWholeSuite() now submits

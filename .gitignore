@@ -8,3 +8,5 @@ out/
 # Spark's own scratch warehouse dir, created by CREATE TABLE statements
 # the sqllogictest sweep attempts against spark_catalog (not this connector).
 spark-warehouse/
+# Claude Code's own local session scratch (per-machine, not project content).
+.claude/

@@ -4,12 +4,14 @@ package farm.query.vgispark.client;
 
 import farm.query.vgi.SettingSpec;
 import farm.query.vgi.VgiService;
+import farm.query.vgi.client.SettingsEncoder;
 import farm.query.vgi.protocol.CatalogAttachRequest;
 import farm.query.vgi.protocol.CatalogAttachResult;
 import farm.query.vgirpc.RpcConnection;
 import farm.query.vgirpc.http.HttpRpcConnection;
 import farm.query.vgirpc.launcher.LaunchConfig;
 import farm.query.vgirpc.launcher.LauncherClient;
+import farm.query.vgirpc.launcher.PosixLauncherSupport;
 import farm.query.vgirpc.transport.RpcTransport;
 import farm.query.vgirpc.transport.SubprocessTransport;
 import farm.query.vgirpc.transport.TcpSocketTransport;
@@ -24,6 +26,7 @@ import java.net.StandardProtocolFamily;
 import java.net.URI;
 import java.net.UnixDomainSocketAddress;
 import java.nio.channels.SocketChannel;
+import java.nio.file.Path;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
@@ -201,6 +204,39 @@ public final class VgiWorkerClient implements AutoCloseable {
         if (cached != null) return cached;
         String resolved = withConnection(a -> a.attach().default_schema());
         if (resolved != null) defaultSchema = resolved;
+        return resolved;
+    }
+
+    // Same lazy/cache rationale as defaultSchema above — the resolved version
+    // fields are worker-level metadata (every pooled connection negotiated
+    // the identical request), not per-connection.
+    private volatile String resolvedDataVersion;
+    private volatile boolean resolvedDataVersionCached;
+    private volatile String resolvedImplementationVersion;
+    private volatile boolean resolvedImplementationVersionCached;
+
+    /**
+     * @return {@code CatalogAttachResult.resolved_data_version} — the data
+     *         version the worker actually selected, honoring {@link
+     *         VgiCatalogConfig#dataVersionSpec()} if one was requested, or
+     *         {@code null} if the worker reported none. No Spark SQL surface
+     *         exposes this today (unlike DuckDB's {@code duckdb_databases()}
+     *         introspection table) — offered here for diagnostics/tests.
+     */
+    public String resolvedDataVersion() {
+        if (resolvedDataVersionCached) return resolvedDataVersion;
+        String resolved = withConnection(a -> a.attach().resolved_data_version());
+        resolvedDataVersion = resolved;
+        resolvedDataVersionCached = true;
+        return resolved;
+    }
+
+    /** @return {@code CatalogAttachResult.resolved_implementation_version} — see {@link #resolvedDataVersion} */
+    public String resolvedImplementationVersion() {
+        if (resolvedImplementationVersionCached) return resolvedImplementationVersion;
+        String resolved = withConnection(a -> a.attach().resolved_implementation_version());
+        resolvedImplementationVersion = resolved;
+        resolvedImplementationVersionCached = true;
         return resolved;
     }
 
@@ -405,12 +441,27 @@ public final class VgiWorkerClient implements AutoCloseable {
         if (location.startsWith("http://") || location.startsWith("https://")) {
             return openAndAttachHttp(config, location);
         }
-        RpcTransport transport = openTransport(location);
+        RpcTransport transport = openTransport(config);
         RpcConnection connection = new RpcConnection(transport);
         VgiService service = connection.proxy(VgiService.class);
-        CatalogAttachResult attach = service.catalog_attach(
-                CatalogAttachRequest.of(config.catalogName(), null, null, null), null);
+        CatalogAttachResult attach = service.catalog_attach(attachRequest(config), null);
         return new Attached(connection, service, attach);
+    }
+
+    /**
+     * Build the {@code CatalogAttachRequest} common to every transport:
+     * {@link VgiCatalogConfig#dataVersionSpec()}/{@link
+     * VgiCatalogConfig#implementationVersion()} (ATTACH-time version
+     * negotiation) and {@link VgiCatalogConfig#attachOptions()} (custom
+     * worker-declared ATTACH options — VGI's {@code AttachOptionSpec}
+     * mechanism), encoded the same way {@code BindRequest.settings} is:
+     * {@link SettingsEncoder}, since {@code CatalogAttachRequest.options}
+     * documents the identical 1-row-named-columns wire shape.
+     */
+    private static CatalogAttachRequest attachRequest(VgiCatalogConfig config) {
+        byte[] options = config.attachOptions().isEmpty() ? null : SettingsEncoder.of(config.attachOptions());
+        return CatalogAttachRequest.of(
+                config.catalogName(), options, config.dataVersionSpec(), config.implementationVersion());
     }
 
     /**
@@ -430,8 +481,7 @@ public final class VgiWorkerClient implements AutoCloseable {
         boolean ok = false;
         try {
             VgiService service = connection.proxy(VgiService.class);
-            CatalogAttachResult attach = service.catalog_attach(
-                    CatalogAttachRequest.of(config.catalogName(), null, null, null), null);
+            CatalogAttachResult attach = service.catalog_attach(attachRequest(config), null);
             Attached a = new Attached(connection, service, attach);
             ok = true;
             return a;
@@ -440,7 +490,8 @@ public final class VgiWorkerClient implements AutoCloseable {
         }
     }
 
-    private static RpcTransport openTransport(String location) {
+    private static RpcTransport openTransport(VgiCatalogConfig config) {
+        String location = config.location();
         if (location.startsWith("unix://")) {
             String path = location.substring("unix://".length());
             return connectUnixSocket(path);
@@ -449,13 +500,7 @@ public final class VgiWorkerClient implements AutoCloseable {
             // A launch: location resolves to a warm, shared worker's unix socket (spawning it
             // if none is running yet) and connects to it exactly like a plain unix:// location.
             List<String> argv = LaunchLocationParser.parseArgv(location.substring("launch:".length()));
-            String socketPath;
-            try {
-                socketPath = LauncherClient.launch(LaunchConfig.of(argv));
-            } catch (IOException e) {
-                throw new UncheckedIOException("failed to launch VGI worker for " + location, e);
-            }
-            return connectUnixSocket(socketPath);
+            return connectUnixSocket(launch(argv, config, location));
         }
         if (location.startsWith("tcp://")) {
             URI uri = URI.create(location);
@@ -467,10 +512,49 @@ public final class VgiWorkerClient implements AutoCloseable {
                         "failed to connect to VGI worker at " + uri.getHost() + ":" + uri.getPort(), e);
             }
         }
-        // Bare command: run through a shell so the operator's own quoting,
+        // Bare command. Run through a shell so the operator's own quoting,
         // env expansion, and PATH lookup behave the way it would on a
-        // terminal — matches the DuckDB extension's own LOCATION contract.
-        return new SubprocessTransport(List.of("/bin/sh", "-c", location));
+        // terminal — matches the DuckDB extension's own LOCATION contract —
+        // but, unlike DuckDB/vgi-trino's own default, route it through the
+        // shared launcher rather than spawning an unshared subprocess per
+        // connection UNLESS the operator opted out (launcher-enabled=false)
+        // — see VgiCatalogConfig#launcherEnabled's own javadoc for why
+        // Spark's specific process topology makes this the better default.
+        // The shell semantics are fully preserved either way: the worker
+        // argv is /bin/sh -c <location>, identical to what SubprocessTransport
+        // ran directly before this existed — only the sharing changes.
+        //
+        // PosixLauncherSupport.available() gates this: launch: needs JDK 22+
+        // (flock(2)/geteuid() via the Foreign Function & Memory API — see
+        // that class's own javadoc); on an older runtime it's a hard
+        // UnsupportedOperationException, not a degraded-but-working mode.
+        // An EXPLICIT launch: location (the branch above) still lets that
+        // exception surface — the operator asked for launcher semantics by
+        // name and deserves to know exactly why it failed. This DEFAULT
+        // path is different: nobody asked for launch: specifically here, so
+        // silently falling back to the always-available subprocess spawn
+        // is the right degrade, not a hard failure over an operator's
+        // deliberately transport-agnostic bare-command location string.
+        List<String> shellArgv = List.of("/bin/sh", "-c", location);
+        if (config.launcherEnabled() && PosixLauncherSupport.available()) {
+            return connectUnixSocket(launch(shellArgv, config, location));
+        }
+        return new SubprocessTransport(shellArgv);
+    }
+
+    private static String launch(List<String> argv, VgiCatalogConfig config, String location) {
+        double idleTimeoutSeconds = config.launcherIdleTimeoutSeconds() != null
+                ? config.launcherIdleTimeoutSeconds()
+                : LaunchConfig.DEFAULT_IDLE_TIMEOUT_SECONDS;
+        Path stateDir = config.launcherStateDir() != null ? Path.of(config.launcherStateDir()) : null;
+        LaunchConfig launchConfig = new LaunchConfig(argv, null, idleTimeoutSeconds,
+                LaunchConfig.DEFAULT_CONNECT_TIMEOUT_SECONDS, LaunchConfig.DEFAULT_WORKER_STARTUP_TIMEOUT_SECONDS,
+                stateDir, null);
+        try {
+            return LauncherClient.launch(launchConfig);
+        } catch (IOException e) {
+            throw new UncheckedIOException("failed to launch VGI worker for " + location, e);
+        }
     }
 
     private static RpcTransport connectUnixSocket(String path) {

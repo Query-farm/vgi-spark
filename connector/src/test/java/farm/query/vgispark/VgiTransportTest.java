@@ -28,7 +28,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
  */
 class VgiTransportTest {
 
-    private static final File VGI_PYTHON = new File(System.getProperty("user.home"), "Development/vgi-python");
+    private static final File VGI_RUST = new File(System.getProperty("user.home"), "Development/vgi-rust");
     private static final String CATALOG = "vgi_example";
 
     private VgiWorkerHarness.Handle worker;
@@ -41,15 +41,22 @@ class VgiTransportTest {
     }
 
     private void start(VgiWorkerHarness.Handle handle) {
+        start(handle, false);
+    }
+
+    private void start(VgiWorkerHarness.Handle handle, boolean disableLauncherDefault) {
         this.worker = handle;
-        this.spark = SparkSession.builder()
+        SparkSession.Builder builder = SparkSession.builder()
                 .master("local[2]")
                 .appName("vgi-spark-transport-test")
                 .config("spark.ui.enabled", "false")
                 .config("spark.sql.catalog." + CATALOG, VgiCatalog.class.getName())
                 .config("spark.sql.catalog." + CATALOG + ".location", handle.location())
-                .config("spark.sql.catalog." + CATALOG + ".catalog-name", "example")
-                .getOrCreate();
+                .config("spark.sql.catalog." + CATALOG + ".catalog-name", "example");
+        if (disableLauncherDefault) {
+            builder.config("spark.sql.catalog." + CATALOG + ".launcher-enabled", "false");
+        }
+        this.spark = builder.getOrCreate();
     }
 
     private void assertNumbersReadsCorrectly() {
@@ -62,32 +69,37 @@ class VgiTransportTest {
     @Test
     @Timeout(60)
     void subprocessTransport() throws Exception {
-        Assumptions.assumeTrue(VGI_PYTHON.isDirectory(), "~/Development/vgi-python not present");
-        start(VgiWorkerHarness.subprocess(VGI_PYTHON));
+        // launcher-enabled=false: a bare-command location now defaults to
+        // launch: semantics (see VgiCatalogConfig#launcherEnabled) — proven
+        // separately by VgiLaunchTransportTest.bareCommandLocationDefaultsToLaunchTransport.
+        // This test's own job is proving the OLD per-connection subprocess
+        // spawn this class is named for still works when explicitly selected.
+        Assumptions.assumeTrue(VGI_RUST.isDirectory(), "~/Development/vgi-rust not present");
+        start(VgiWorkerHarness.subprocess(VGI_RUST), true);
         assertNumbersReadsCorrectly();
     }
 
     @Test
     @Timeout(60)
     void unixSocketTransport() throws Exception {
-        Assumptions.assumeTrue(VGI_PYTHON.isDirectory(), "~/Development/vgi-python not present");
-        start(VgiWorkerHarness.unix(VGI_PYTHON));
+        Assumptions.assumeTrue(VGI_RUST.isDirectory(), "~/Development/vgi-rust not present");
+        start(VgiWorkerHarness.unix(VGI_RUST));
         assertNumbersReadsCorrectly();
     }
 
     @Test
     @Timeout(60)
     void tcpTransport() throws Exception {
-        Assumptions.assumeTrue(VGI_PYTHON.isDirectory(), "~/Development/vgi-python not present");
-        start(VgiWorkerHarness.tcp(VGI_PYTHON));
+        Assumptions.assumeTrue(VGI_RUST.isDirectory(), "~/Development/vgi-rust not present");
+        start(VgiWorkerHarness.tcp(VGI_RUST));
         assertNumbersReadsCorrectly();
     }
 
     @Test
     @Timeout(90)
     void httpTransport() throws Exception {
-        Assumptions.assumeTrue(VGI_PYTHON.isDirectory(), "~/Development/vgi-python not present");
-        start(VgiWorkerHarness.http(VGI_PYTHON));
+        Assumptions.assumeTrue(VGI_RUST.isDirectory(), "~/Development/vgi-rust not present");
+        start(VgiWorkerHarness.http(VGI_RUST));
         assertNumbersReadsCorrectly();
     }
 
@@ -96,8 +108,8 @@ class VgiTransportTest {
     @Test
     @Timeout(60)
     void tcpTransportReadsRealFilteredValues() throws Exception {
-        Assumptions.assumeTrue(VGI_PYTHON.isDirectory(), "~/Development/vgi-python not present");
-        start(VgiWorkerHarness.tcp(VGI_PYTHON));
+        Assumptions.assumeTrue(VGI_RUST.isDirectory(), "~/Development/vgi-rust not present");
+        start(VgiWorkerHarness.tcp(VGI_RUST));
         List<Row> rows = spark.sql(
                 "SELECT value FROM " + CATALOG + ".data.numbers WHERE value >= 97 ORDER BY value")
                 .collectAsList();

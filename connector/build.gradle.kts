@@ -8,6 +8,22 @@
 val sparkVersion = "4.2.0"
 val scalaBinaryVersion = "2.13"
 
+// A JDK 22+ toolchain (to exercise the real launch: transport under test —
+// see root build.gradle.kts) was tried and reverted: forcing Netty down to
+// vgi-trino's own 4.1.114.Final (to dodge arrow-memory-netty 18.1.0's
+// UnsupportedOperationException under JDK 25's stricter Unsafe checks —
+// NettyAllocationManager's static init crashing via EmptyByteBuf
+// .memoryAddress -> UnsafeDirectLittleEndian.<init>) breaks Spark's OWN
+// networking instead: Spark 4.2.0's NettyBlockTransferService needs newer
+// netty-common APIs (io.netty.util.concurrent.ThreadAwareExecutor) that
+// don't exist in 4.1.114.Final, so every Spark-using test then failed with
+// NoClassDefFoundError instead. Unlike vgi-trino (no such conflicting
+// Netty consumer), this repo has two dependency trees wanting different
+// Netty majors — not resolvable with a single force. See
+// VgiCatalogConfig#launcherEnabled's own javadoc for how the launch:
+// default's JDK 22+ gate is verified instead (isolated reproduction outside
+// this test suite, plus vgi-trino's own proven identical wiring).
+
 dependencies {
     // Spark is provided by the cluster (spark-submit's own classpath) at
     // runtime, exactly like trino-spi is compileOnly in vgi-trino.

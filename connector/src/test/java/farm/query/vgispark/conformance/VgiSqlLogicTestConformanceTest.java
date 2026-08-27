@@ -39,7 +39,7 @@ import static org.junit.jupiter.api.Assertions.fail;
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class VgiSqlLogicTestConformanceTest {
 
-    private static final File VGI_PYTHON = new File(System.getProperty("user.home"), "Development/vgi-python");
+    private static final File VGI_RUST = new File(System.getProperty("user.home"), "Development/vgi-rust");
     private static final File VGI_TEST_ROOT =
             new File(System.getProperty("user.home"), "Development/vgi/test/sql/integration");
     private static final String SPARK_CATALOG = "vgi_example";
@@ -50,13 +50,13 @@ class VgiSqlLogicTestConformanceTest {
 
     @BeforeAll
     void start() throws Exception {
-        Assumptions.assumeTrue(VGI_PYTHON.isDirectory(),
-                "~/Development/vgi-python not present — skipping sqllogictest conformance run");
+        Assumptions.assumeTrue(VGI_RUST.isDirectory(),
+                "~/Development/vgi-rust not present — skipping sqllogictest conformance run");
         Assumptions.assumeTrue(VGI_TEST_ROOT.isDirectory(),
                 "~/Development/vgi/test/sql/integration not present — skipping sqllogictest conformance run");
         // unix(), not subprocess() — see VgiSqlLogicTestSweepTest's identical
         // comment: avoids forking a fresh worker subprocess per Spark task.
-        worker = VgiWorkerHarness.unix(VGI_PYTHON);
+        worker = VgiWorkerHarness.unix(VGI_RUST);
 
         spark = SparkSession.builder()
                 .master("local[2]")

@@ -85,6 +85,17 @@ public final class VgiCatalog implements TableCatalog, SupportsNamespaces, Funct
         return name;
     }
 
+    /**
+     * @return this catalog's pooled worker client — package-visible for
+     *         diagnostics/tests that need something with no Spark SQL
+     *         surface of its own, e.g. {@link VgiWorkerClient#resolvedDataVersion()}
+     *         (no {@code duckdb_databases()} equivalent exists to read this
+     *         back through SQL). Not part of this class's public API.
+     */
+    VgiWorkerClient client() {
+        return client;
+    }
+
     // ------------------------------------------------------------------
     // SupportsNamespaces — VGI schemas are single-level; there is no nested
     // namespace concept, so every namespace-typed argument here is expected

@@ -29,8 +29,11 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * End-to-end: a real local {@link SparkSession}, a real {@link VgiCatalog}
- * registered against it, and a real Python fixture worker subprocess behind
- * that — catalog/schema/table discovery, bind, {@code table_function_plan}
+ * registered against it, and a real reference fixture worker subprocess
+ * ({@code vgi-rust}'s {@code vgi-example-worker} — see {@link
+ * farm.query.vgispark.testing.VgiWorkerHarness}'s own javadoc for why the
+ * Rust binary, not the wire-compatible Python one, backs this connector's
+ * own test suite) behind that — catalog/schema/table discovery, bind, {@code table_function_plan}
  * (the not-split-capable sentinel path — {@code numbers} is backed by
  * {@code sequence}, which doesn't implement a real plan), and reading actual
  * row values back through a {@link org.apache.spark.sql.vectorized.ArrowColumnVector}
@@ -44,7 +47,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class VgiCatalogQueryTest {
 
-    private static final File VGI_PYTHON = new File(System.getProperty("user.home"), "Development/vgi-python");
+    private static final File VGI_RUST = new File(System.getProperty("user.home"), "Development/vgi-rust");
     private static final String CATALOG = "vgi_example";
 
     private VgiWorkerHarness.Handle worker;
@@ -52,11 +55,11 @@ class VgiCatalogQueryTest {
 
     @BeforeAll
     void start() throws Exception {
-        Assumptions.assumeTrue(VGI_PYTHON.isDirectory(),
-                "~/Development/vgi-python not present — skipping VGI catalog query test");
+        Assumptions.assumeTrue(VGI_RUST.isDirectory(),
+                "~/Development/vgi-rust not present — skipping VGI catalog query test");
         // unix(), not subprocess() — see VgiSqlLogicTestSweepTest's identical
         // comment: avoids forking a fresh worker subprocess per Spark task.
-        worker = VgiWorkerHarness.unix(VGI_PYTHON);
+        worker = VgiWorkerHarness.unix(VGI_RUST);
 
         spark = SparkSession.builder()
                 .master("local[2]")
