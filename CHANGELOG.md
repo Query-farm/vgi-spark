@@ -4,6 +4,43 @@ All notable changes to this project are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.3.0] — 2026-08-27
+
+### Added
+
+- `connector:assembleDeployDir` — assembles this connector's own jar plus
+  its non-Spark runtime dependencies into `connector/build/deploy/`, ready
+  for `spark-submit --jars`. Deliberately **excludes Arrow and Netty jars**:
+  Spark 4.2.0 itself bundles newer, compatible versions of both, confirmed
+  via this module's own test-classpath resolution (not guessed) and now
+  also confirmed in a real deployment (see below).
+- `docker/` — a real Spark 4.2.0 image (built from Apache's own tarball, no
+  official `apache/spark:4.2.0` image exists) with this connector baked in,
+  paired with a `vgi-rust`-built worker container. `docker compose up
+  --build spark` for a one-command try-it-now `spark-shell`; the
+  `spark-cluster` profile for a genuine Spark standalone cluster (separate
+  `spark-master`/`spark-worker` containers, an actually-separate executor
+  JVM process) — verified end to end: `spark-submit --master
+  spark://spark-master:7077` against the `tcp://` worker container returns
+  the correct result. This is real, separate-process confirmation of both
+  the Arrow/Netty exclusion above and the executor-reachability behavior
+  documented in README.md's "Deploying it" section.
+- README.md: a full "Deploying it" section (jar assembly, the
+  executor-reachability constraint for bare-command/`unix://`/`launch:`
+  locations, Spark/Scala compatibility, and the Docker quick-start).
+
+### Fixed
+
+- `VgiCatalogConfig`'s auto-generated `toString()` (it's a Java record)
+  printed `httpBearerToken` and every `attachOptions` value — which can
+  legitimately carry secrets, e.g. an API key — in full. Now redacted.
+  Nothing in this connector's own code logged a whole `VgiCatalogConfig`,
+  but `VgiTable`/`VgiScan` are records that embed one, and Spark's own
+  internals (`explain()`, an exception message, the UI) could plausibly
+  call `toString()` on those without this connector being consulted.
+
+[0.3.0]: https://github.com/Query-farm/vgi-spark/releases/tag/v0.3.0
+
 ## [0.2.0] — 2026-08-27
 
 First tagged release. `farm.query:vgi-spark` had been developed and used
