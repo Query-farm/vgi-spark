@@ -5,6 +5,7 @@ package farm.query.vgispark;
 import farm.query.vgispark.client.VgiWorkerClient;
 import farm.query.vgispark.function.VgiScalarFunctions;
 import farm.query.vgispark.testing.VgiWorkerHarness;
+import org.apache.spark.sql.SparkSession;
 import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.catalyst.expressions.GenericInternalRow;
 import org.apache.spark.sql.connector.catalog.Identifier;
@@ -40,9 +41,11 @@ class VgiScalarNullArgumentTest {
 
     private VgiWorkerHarness.Handle worker;
     private VgiWorkerClient client;
+    private SparkSession spark;
 
     @AfterEach
     void stop() throws Exception {
+        if (spark != null) spark.stop();
         if (client != null) client.close();
         if (worker != null) worker.teardown().close();
     }
@@ -51,6 +54,11 @@ class VgiScalarNullArgumentTest {
     @Timeout(30)
     void formatNumberDefaultOverloadAcceptsANullValueArgument() throws Exception {
         Assumptions.assumeTrue(VGI_RUST.isDirectory(), "~/Development/vgi-rust not present");
+        // bind()'s own currentSettingsBytes reads SparkSession.active() —
+        // needs a real session even though this test otherwise never
+        // touches Spark SQL/ConstantFolding at all.
+        spark = SparkSession.builder().master("local[1]").appName("vgi-spark-null-arg-repro")
+                .config("spark.ui.enabled", "false").getOrCreate();
         worker = VgiWorkerHarness.unix(VGI_RUST);
         VgiCatalogConfig config = VgiCatalogConfig.fromOptions(new CaseInsensitiveStringMap(
                 Map.of("location", worker.location(), "catalog-name", "example")));
