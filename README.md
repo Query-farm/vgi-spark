@@ -57,16 +57,6 @@ what's implemented so far:
   bytecode), not the microsecond precision VGI workers commonly use; this
   throws a clear `UnsupportedOperationException` rather than silently
   mis-reading the column.
-- A scalar function called with an **all-literal argument list including a
-  NULL** (e.g. `SELECT some_scalar_fn(NULL::DOUBLE)`) can fail — Spark's own
-  `ConstantFolding` optimizer rule evaluates such calls eagerly, calling the
-  same bound function instance multiple times in a row outside normal
-  per-row task execution, which can desync VGI's lockstep-per-connection RPC
-  framing (`NoSuchElementException` from the exchange read). Root cause
-  isolated (confirmed via a bounded-retry-with-a-fresh-connection test that
-  it is **not** simple connection reuse — a fresh connection fails
-  identically) but not yet fixed; likely belongs in `vgi-rpc-java`'s own
-  stream-close/drain sequencing rather than this connector.
 
 **Non-goals**, all with no Spark SQL surface to hook into: multi-branch
 non-function/non-CSV branches (`CATALOG_TABLE`/non-CSV `FORMAT` branches —
@@ -91,7 +81,7 @@ harness doesn't set up (a non-default `ATTACH` alias/catalog/auth, or
 left and reports real pass/fail counts plus a full per-file breakdown to
 `connector/build/sqllogictest-sweep-report.txt`.
 
-Latest run: 191 of 328 files eligible; 711 of 2952 attempted records pass
+Latest run: 191 of 328 files eligible; 720 of 2952 attempted records pass
 (19 files fully passing, 172 with at least one failure). The largest single
 category of the remainder — by a wide margin — is VGI table-function `CALL`
 syntax used through DuckDB's `TABLE(...)` call shape, which the sweep's

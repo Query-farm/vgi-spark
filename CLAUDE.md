@@ -206,8 +206,62 @@ sending a `null`/unqualified `schema_name` on scan-function binds — the
 exact same two bugs this connector had until 2026-08-27. Likely never
 surfaced there because `vgi-trino`'s own test corpus doesn't happen to
 exercise a table whose backing function renames columns, or a worker that
-enforces schema_name as strictly as `vgi-rust`'s does. Worth porting both
-fixes back if `vgi-trino` is ever run against `vgi-rust`.
+enforces schema_name as strictly as `vgi-rust`'s does. Also confirmed
+`vgi-trino` never reads `FunctionInfo.null_handling` either (grepped) — the
+same NULL-scalar-argument bug documented below, just never surfaced there.
+Worth porting all three fixes back if `vgi-trino` is ever run against
+`vgi-rust`.
+
+## Fixed: scalar function called with a NULL argument (2026-08-27)
+
+A scalar function called via an all-literal argument list including a NULL
+(e.g. `SELECT some_scalar_fn(NULL::DOUBLE)`) threw a bare, unexplained
+`NoSuchElementException` from `ClientStreamSession.readNextDataBatch`.
+Root-caused via direct worker instrumentation (temporary `eprintln!`/
+`std::fs::write` diagnostics added to `vgi-rust`'s `dispatch.rs` and
+`vgi-rpc-rust`'s `server.rs`, uncommitted, reverted after diagnosis —
+needed a `[patch.crates-io]` override in `vgi-rust`'s `Cargo.toml` plus a
+matching version bump in `vgi-rpc-rust`'s own `Cargo.toml` to get a locally
+edited `vgi-rpc` picked up over the published crate; also reverted):
+
+`FunctionInfo.null_handling` encodes DuckDB's own "STRICT SQL function"
+contract — a `DEFAULT`-handling function (the common case; `SPECIAL` opts
+out) is short-circuited to a NULL result by the *calling engine*, for any
+NULL argument, without the function ever being invoked at all. DuckDB's own
+query planner does this upstream of the RPC entirely — confirmed by reading
+its scalar-function corpus (`~/Development/vgi/test/sql/integration/overload/scalar_overload.test`
+expects `format_number(NULL::DOUBLE)` etc. to return `NULL`) and its own
+`vgi_scalar_function_impl.cpp` (no null-specific short-circuit in the
+extension's own callback code — it's handled further upstream, in DuckDB's
+own function-registration nullability contract). Spark's `ScalarFunction<T>`
+API has no equivalent declarative contract of its own — `produceResult` is
+always called regardless of null arguments — and this connector never read
+`null_handling` at all, so it always sent the RPC through unconditionally.
+Sending an actual null for a `DEFAULT`-handling argument hits a real,
+worker-side Arrow schema-validation error (confirmed directly:
+`"Column 'value' is declared as non-nullable but contains null values"`)
+that the client never sees — `vgi-rpc-rust`'s own lockstep server loop
+swallows a `read_next()` failure into a silent stream close (`Err(_) =>
+break`, no error frame written at all), which is the reason this surfaced
+as a bare `NoSuchElementException` with zero explanation instead of a clear
+error. **That silent-swallow is a real, separate bug worth reporting
+upstream to `vgi-rpc-rust`** — flagged to the user, not fixed here (not
+this connector's code to fix, and not blocking once the real cause was
+known).
+
+Fix (`VgiUnboundScalarFunction`/`VgiScalarFunction`): compute
+`shortCircuitOnNull` from `info.null_handling()` at bind time (anything but
+`"SPECIAL"` → true), and check every row's full arity for a null value
+before ever calling `ensureConnection()`/attempting the RPC — matching
+DuckDB's own engine-level contract, entirely client-side. Three other
+hypotheses were tested and ruled out first (kept as permanent regression
+coverage in `VgiScalarNullArgumentTest`, which calls `produceResult`
+directly — no Spark SQL involved): Spark's `ConstantFolding` calling
+`produceResult` repeatedly on the same instance (a single direct call
+reproduced identically — not about repetition), connection reuse (a
+bounded retry with a genuinely fresh connection failed identically —
+tried and reverted, see git history), and a worker crash (checked its
+stderr directly, twice, clean both times).
 
 ## Open bugs (not yet fixed)
 
@@ -219,22 +273,6 @@ fixes back if `vgi-trino` is ever run against `vgi-rust`.
   `ArrowColumnVector` support can't be coerced into it); not attempted —
   `VgiTypeMapping.toSparkType` throws a clear `UnsupportedOperationException`
   instead of silently mis-reading the column.
-- **A scalar function called via an all-literal argument list including a
-  NULL can fail** (`NoSuchElementException` from
-  `ClientStreamSession.readNextDataBatch`, surfaced through
-  `VgiSqlLogicTestConformanceTest`'s `scalarOverloadMatchesTheRealTestFile`).
-  Spark's `ConstantFolding` optimizer rule calls `produceResult` on the
-  bound function eagerly, sometimes multiple times in a row on the same
-  instance, outside normal per-row task execution. Investigated 2026-08-27:
-  confirmed via instrumentation that the same instance IS called repeatedly;
-  built and tested a bounded-retry-with-a-fresh-connection fix on the theory
-  that repeated `init()` exchanges on one reused connection desync the wire
-  — **the retry did not help** (a genuinely fresh connection fails
-  identically on its first call), which rules out simple connection reuse
-  as the cause. Reverted the retry (see git history — "Revert ... bounded
-  retry"). Checked the worker's own stderr directly (temporarily un-discarding
-  it in `VgiWorkerHarness`) — no panic, no error, clean stream close. Not
-  yet root-caused; needs wire-level tracing, not more guessing.
 - **Aggregate functions don't support `any`-typed or `vgi_const` arguments**
   (scalar functions already do — `VgiUnboundScalarFunction`;
   `VgiUnboundAggregateFunction` doesn't yet extend the same handling). The
@@ -246,15 +284,16 @@ fixes back if `vgi-trino` is ever run against `vgi-rust`.
 Session summary: implemented `launch:` (as the bare-command default),
 custom ATTACH options, and ATTACH-time version negotiation (roadmap tier 3);
 switched the whole test suite from the Python fixture worker to the
-compiled `vgi-rust` binary for speed; found and fixed three real,
+compiled `vgi-rust` binary for speed; found and fixed four real,
 previously-undiscovered wire-protocol bugs (schema_name omission,
 case-sensitive `function_type` comparisons that meant `CALL`/aggregates
-never worked at all, and the declarative-table column-rename projection
-mismatch); found and removed the `arrow.memory.debug.allocator` performance
-landmine; added cross-class and intra-class test parallelism. Full suite:
-~76 tests, 3 known failures (the `opt_time` gap ×2, the NULL-constant-fold
-bug ×1), ~108 seconds wall clock on a 48-core box. Sqllogictest sweep: 191
-of 328 files eligible, 711 of 2952 records pass (19 files fully passing) —
+never worked at all, the declarative-table column-rename projection
+mismatch, and the NULL-scalar-argument short-circuit gap); found and
+removed the `arrow.memory.debug.allocator` performance landmine; added
+cross-class and intra-class test parallelism. Full suite: ~76 tests, 2
+known failures (the `opt_time` gap), ~107 seconds wall clock on a 48-core
+box. Sqllogictest sweep: 191 of 328 files eligible, 720 of 2952 records
+pass (up from 711 before the NULL-argument fix) —
 up from a stale 405/2944 baseline that predates this session's fixes.
 
 Work happened partly on a temporary EC2 instance (Amazon Linux 2023,
