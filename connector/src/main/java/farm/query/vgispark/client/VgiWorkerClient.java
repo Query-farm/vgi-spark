@@ -299,7 +299,11 @@ public final class VgiWorkerClient implements AutoCloseable {
                     // narrows the same "TABLE_FUNCTION" wire category the
                     // same way) must never shadow the real scan function's
                     // schema.
-                    if (!"TABLE".equals(info.function_type())) continue;
+                    // "table", not "TABLE" — see VgiTableProcedures's
+                    // identical fix and its own comment: FunctionInfo
+                    // .function_type carries the wire's lowercase
+                    // dict-encoded enum payload verbatim.
+                    if (!"table".equalsIgnoreCase(info.function_type())) continue;
                     byName.putIfAbsent(info.name().toLowerCase(Locale.ROOT), info.schema_name());
                 }
             }

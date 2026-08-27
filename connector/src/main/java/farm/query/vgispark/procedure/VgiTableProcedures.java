@@ -48,7 +48,14 @@ public final class VgiTableProcedures {
         List<Identifier> out = new ArrayList<>(resp.items().size());
         for (byte[] item : resp.items()) {
             FunctionInfo info = RecordCodec.deserializeFromBytes(item, FunctionInfo.class);
-            if (!"TABLE".equals(info.function_type())) continue; // table_in_out/table_buffering excluded — see class javadoc
+            // "table", not "TABLE": FunctionInfo.function_type carries the
+            // wire's own dict-encoded enum payload verbatim (vgi-rust's
+            // vgi-protocol/src/protocol/enums.rs: function_type::TABLE =
+            // "table", lowercase) -- an exact-case match against the RPC
+            // CALL's own uppercase "TABLE_FUNCTION" category constant was
+            // never going to match this response FIELD's value; the two are
+            // unrelated strings that only happened to share four letters.
+            if (!"table".equalsIgnoreCase(info.function_type())) continue; // table_in_out/table_buffering excluded — see class javadoc
             out.add(Identifier.of(new String[] {schemaName}, info.name()));
         }
         return out.toArray(new Identifier[0]);
@@ -89,7 +96,7 @@ public final class VgiTableProcedures {
                 .catalog_schema_contents_functions(a.handle(), schemaName, "TABLE_FUNCTION", null, null));
         for (byte[] item : resp.items()) {
             FunctionInfo info = RecordCodec.deserializeFromBytes(item, FunctionInfo.class);
-            if (info.name().equalsIgnoreCase(procName) && "TABLE".equals(info.function_type())) {
+            if (info.name().equalsIgnoreCase(procName) && "table".equalsIgnoreCase(info.function_type())) {
                 return VgiUnboundTableProcedure.tryBuild(client, config, schemaName, info);
             }
         }

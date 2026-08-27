@@ -43,7 +43,12 @@ public final class VgiAggregateFunctions {
         List<Identifier> out = new ArrayList<>(resp.items().size());
         for (byte[] item : resp.items()) {
             FunctionInfo info = RecordCodec.deserializeFromBytes(item, FunctionInfo.class);
-            if (!"AGGREGATE".equals(info.function_type())) continue;
+            // "aggregate", not "AGGREGATE" — see VgiTableProcedures's identical
+            // fix and its own comment: FunctionInfo.function_type carries the
+            // wire's lowercase dict-encoded enum payload verbatim, unrelated
+            // to the RPC call's own uppercase "AGGREGATE_FUNCTION" category
+            // constant.
+            if (!"aggregate".equalsIgnoreCase(info.function_type())) continue;
             out.add(Identifier.of(new String[] {schemaName}, info.name()));
         }
         return out.toArray(new Identifier[0]);
@@ -80,7 +85,7 @@ public final class VgiAggregateFunctions {
                 .catalog_schema_contents_functions(a.handle(), schemaName, "AGGREGATE_FUNCTION", null, null));
         for (byte[] item : resp.items()) {
             FunctionInfo info = RecordCodec.deserializeFromBytes(item, FunctionInfo.class);
-            if (info.name().equalsIgnoreCase(functionName) && "AGGREGATE".equals(info.function_type())) {
+            if (info.name().equalsIgnoreCase(functionName) && "aggregate".equalsIgnoreCase(info.function_type())) {
                 return VgiUnboundAggregateFunction.tryBuild(client, config, schemaName, info);
             }
         }
