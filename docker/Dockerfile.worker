@@ -1,0 +1,43 @@
+# Copyright 2026 Query Farm LLC - https://query.farm
+#
+# The VGI reference worker (vgi-rust's vgi-example-worker binary), built
+# fresh from source inside the image — unlike vgi-trino's own docker/
+# setup, which mounts the (interpreted, no-compile-step) vgi-python
+# checkout from the host, a compiled Rust binary has no equivalent
+# "just mount it" shortcut, so this clones vgi-rust itself rather than
+# depending on a host-relative sibling checkout the way the connector's
+# own local tests do (see ../CLAUDE.md's "Test worker" section).
+#
+# Build:
+#   docker build -f docker/Dockerfile.worker -t vgi-spark-worker .
+# (docker-compose.yml does this automatically as part of `docker compose up --build`.)
+
+FROM rust:1-slim-bookworm AS builder
+
+# VGI_RUST_REF: which vgi-rust commit to build — floating on main by
+# default (matches this repo's own .github/workflows/ci.yml choice to keep
+# VGI_RUST_REF on main rather than pin it), overridable via --build-arg for
+# a reproducible pin when one is actually wanted.
+ARG VGI_RUST_REF=main
+
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+RUN git clone https://github.com/Query-farm/vgi-rust.git . \
+    && git checkout "$VGI_RUST_REF"
+RUN cargo build --release --bin vgi-example-worker
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /build/target/release/vgi-example-worker /usr/local/bin/vgi-example-worker
+
+# VGI_WORKER_CATALOG_NAME selects which fixture catalog the one binary
+# serves (default "example" — see ../CLAUDE.md's own note on this env var);
+# docker-compose.yml's own `environment:` can override it per service.
+ENV VGI_WORKER_CATALOG_NAME=example
+
+EXPOSE 8765
+ENTRYPOINT ["vgi-example-worker"]
+CMD ["--tcp", "0.0.0.0:8765"]

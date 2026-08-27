@@ -1,0 +1,122 @@
+# Copyright 2026 Query Farm LLC - https://query.farm
+#
+# Worked example: Spark + this connector + the vgi-rust reference worker,
+# as separate containers — tcp:// is what crosses a container boundary
+# cleanly (a bare-command/unix:// location needs the worker spawnable/
+# reachable on every executor specifically, which is a real constraint
+# worth demonstrating with, not routing around — see the `spark-cluster`
+# profile below for that).
+#
+# Build and start (from the repo root):
+#   ./gradlew :connector:assembleDeployDir
+#   docker compose -f docker/docker-compose.yml up --build spark
+#
+# Then, in the spark-shell session that starts:
+#   spark.sql("SELECT * FROM vgi_example.data.numbers").show()
+#
+# spark.sql.catalog.* is set via SPARK_SHELL flags on the `spark` service's
+# own command below rather than a mounted properties file — spark-shell has
+# no config-file equivalent to Trino's catalog properties directory, these
+# are plain --conf flags spark-submit/spark-shell/pyspark all accept
+# identically.
+
+services:
+  vgi-worker:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.worker
+    expose:
+      - "8765"
+    healthcheck:
+      # The image's own vgi-example-worker binary again, as a plain TCP
+      # connect check -- no python3/curl needed in this slim image (compare
+      # vgi-trino's own compose file, which reaches for the fixture worker
+      # image's bundled python3 for the identical purpose).
+      test: ["CMD-SHELL", "timeout 2 bash -c '</dev/tcp/127.0.0.1/8765' || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+
+  spark:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    depends_on:
+      vgi-worker:
+        condition: service_healthy
+    stdin_open: true
+    tty: true
+    command:
+      - spark-shell
+      - --conf
+      - spark.sql.catalog.vgi_example=farm.query.vgispark.VgiCatalog
+      - --conf
+      - spark.sql.catalog.vgi_example.location=tcp://vgi-worker:8765
+      - --conf
+      - spark.sql.catalog.vgi_example.catalog-name=example
+
+  # `docker compose --profile spark-cluster up --build` instead: a REAL
+  # Spark standalone cluster (separate master + worker containers, the
+  # worker spawning genuinely separate executor JVM child processes) rather
+  # than spark-shell's own local[*] mode above -- the scenario that
+  # actually exercises the constraint README.md's "Deploying it" section
+  # documents (VgiPartitionReader opens its own connection ON THE EXECUTOR;
+  # a bare-command/unix:// location needs to be spawnable/reachable from
+  # every executor, not just wherever spark-submit itself runs).
+  spark-master:
+    profiles: ["spark-cluster"]
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    # start-master.sh backgrounds its own daemon and returns immediately by
+    # design (Spark's own launch scripts) -- `tail -f` on its own log keeps
+    # the container alive afterward (and doubles as visible master output),
+    # or compose sees the shell exit right after starting it and tears the
+    # container down.
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - >
+        start-master.sh --host spark-master &&
+        tail -f /opt/spark/logs/*.out
+    expose:
+      - "7077"
+      - "8080"
+
+  spark-worker:
+    profiles: ["spark-cluster"]
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    depends_on:
+      - spark-master
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - >
+        start-worker.sh spark://spark-master:7077 &&
+        tail -f /opt/spark/logs/*.out
+
+  spark-submit:
+    profiles: ["spark-cluster"]
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    depends_on:
+      spark-master:
+        condition: service_started
+      spark-worker:
+        condition: service_started
+      vgi-worker:
+        condition: service_healthy
+    stdin_open: true
+    tty: true
+    command:
+      - spark-shell
+      - --master
+      - spark://spark-master:7077
+      - --conf
+      - spark.sql.catalog.vgi_example=farm.query.vgispark.VgiCatalog
+      - --conf
+      - spark.sql.catalog.vgi_example.location=tcp://vgi-worker:8765
+      - --conf
+      - spark.sql.catalog.vgi_example.catalog-name=example
