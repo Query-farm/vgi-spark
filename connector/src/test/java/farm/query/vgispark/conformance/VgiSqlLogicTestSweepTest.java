@@ -88,10 +88,16 @@ class VgiSqlLogicTestSweepTest {
     // parallelism only. Bounded, not "as many as files": the worker is a
     // single vgi-example-worker process serving connections on its own
     // threads, so unlimited concurrency wouldn't keep scaling this driver
-    // machine's own resources indefinitely, just add contention. Matches
-    // FILE_PARALLELISM to the driver pool size below and to a plausible
-    // dev-machine core count.
-    private static final int FILE_PARALLELISM = 8;
+    // machine's own resources indefinitely, just add contention. Derived from
+    // the ACTUAL core count rather than a hardcoded guess (a stale "8" here
+    // once meant "a plausible dev-machine core count" but silently starved a
+    // run on a bigger box instead of scaling up to it) — capped at 32 since
+    // the Rust worker's own --unix mode, while threaded, is still one
+    // process, and past some width the RPC lockstep-per-connection
+    // constraint means more concurrent connections mostly just add
+    // contention on that one process rather than real throughput.
+    private static final int FILE_PARALLELISM =
+            Math.max(2, Math.min(32, Runtime.getRuntime().availableProcessors()));
 
     private VgiWorkerHarness.Handle worker;
     private SparkSession spark;
