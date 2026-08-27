@@ -119,7 +119,21 @@ final class SqlLogicTestRunner {
                     default -> { }
                 }
             } catch (Exception e) {
-                failures.add("unexpected failure for:\n" + sparkSql + "\n" + e);
+                // The full cause chain, not just e.toString(): an exception
+                // with no message of its own (e.g. NoSuchElementException)
+                // toString()s down to a bare class name, which tells a
+                // debugging session nothing about WHERE it actually threw —
+                // exactly the gap that made this method's own scalar-overload
+                // NULL-argument failures unreadable before this existed.
+                StringBuilder sb = new StringBuilder("unexpected failure for:\n").append(sparkSql).append('\n');
+                for (Throwable t = e; t != null; t = t.getCause()) {
+                    sb.append(t.getClass().getName()).append(": ").append(t.getMessage()).append('\n');
+                    StackTraceElement[] trace = t.getStackTrace();
+                    for (int i = 0; i < Math.min(8, trace.length); i++) {
+                        sb.append("    at ").append(trace[i]).append('\n');
+                    }
+                }
+                failures.add(sb.toString());
             }
         }
         return new Result(executed, skipped, List.copyOf(failures));
