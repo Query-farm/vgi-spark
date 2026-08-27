@@ -80,4 +80,33 @@ class VgiScalarNullArgumentTest {
         Object result = bound.produceResult(row);
         org.junit.jupiter.api.Assertions.assertNull(result);
     }
+
+    @Test
+    @Timeout(30)
+    void formatNumberDefaultOverloadAcceptsANonNullValueArgument() throws Exception {
+        // Control case: same harness, same bound function, a NON-null row —
+        // confirms the test setup itself is sound and isolates the failure
+        // to the null path specifically, not e.g. a bind()/schema mismatch
+        // this whole harness shares with the null-argument test above.
+        Assumptions.assumeTrue(VGI_RUST.isDirectory(), "~/Development/vgi-rust not present");
+        spark = SparkSession.builder().master("local[1]").appName("vgi-spark-non-null-arg-control")
+                .config("spark.ui.enabled", "false").getOrCreate();
+        worker = VgiWorkerHarness.unix(VGI_RUST);
+        VgiCatalogConfig config = VgiCatalogConfig.fromOptions(new CaseInsensitiveStringMap(
+                Map.of("location", worker.location(), "catalog-name", "example")));
+        client = new VgiWorkerClient(config);
+
+        UnboundFunction unbound = VgiScalarFunctions.loadFunction(client, config,
+                Identifier.of(new String[] {"main"}, "format_number"));
+        StructType inputSchema = new StructType(new StructField[] {
+                new StructField("value", DataTypes.DoubleType, true, Metadata.empty())
+        });
+        @SuppressWarnings("unchecked")
+        ScalarFunction<Object> bound = (ScalarFunction<Object>) unbound.bind(inputSchema);
+
+        InternalRow row = new GenericInternalRow(new Object[] {5.0});
+        Object result = bound.produceResult(row);
+        org.junit.jupiter.api.Assertions.assertEquals(
+                org.apache.spark.unsafe.types.UTF8String.fromString("5"), result);
+    }
 }
