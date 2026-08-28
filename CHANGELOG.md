@@ -4,6 +4,27 @@ All notable changes to this project are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning
 follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- Native scan-function delegation: a table backed by a `read_parquet`/
+  `read_csv`/`iceberg_scan`-delegating worker (VGI's own mechanism — the
+  worker names a well-known reader instead of hosting a function) is now read
+  via Spark's own real Parquet/CSV/Iceberg `Table` implementations, not
+  RPC-bound to the worker. Fixes a real, previously-undiscovered gap found
+  live against a public worker (`vgi-overture-maps-typescript`) that ships no
+  data at all — every table delegated to `read_parquet`, and this connector
+  always failed with `FunctionNotFoundError` before this fix. `read_parquet`
+  confirmed live end to end (real Overture Maps rows back); `read_csv`/
+  `iceberg_scan` shipped with unit coverage only, unverified against a real
+  worker (no known worker delegates to either). New catalog config key:
+  `acknowledge-native-scan-required-filters` (see README's Configuration
+  table). Iceberg support needs a new, operator-supplied `compileOnly`
+  dependency (`iceberg-spark-runtime`) on the Spark cluster's own classpath —
+  see README's "Optional dependencies" note. See `CLAUDE.md`'s own "Added:
+  native scan-function delegation" writeup for the full design.
+
 ## [0.3.0] — 2026-08-27
 
 ### Added

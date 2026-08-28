@@ -712,6 +712,12 @@ escaping) — recognizing exactly the three `format_options` keys the real fixtu
 local filesystem paths / `file://` URIs are supported (no S3/HTTP). Parquet/delta/iceberg format
 branches are refused, not attempted — a real follow-up, not a silent gap.
 
+**Not the same thing as item 13's native scan-function delegation below**, despite the surface
+similarity — this is a worker EXPLICITLY declaring a FORMAT branch; item 13 is a FUNCTION branch
+whose `function_name` happens to be a DuckDB built-in (`read_parquet`/`iceberg_scan`/...). Item 13's
+Parquet/Iceberg support doesn't relax this item's own "csv only" scope — a genuine FORMAT branch of
+format `"parquet"`/`"iceberg"` is still refused here.
+
 **Unlocks:** the underlying CAPABILITY, verified live end to end against the real fixture's
 `data.multi_branch_format` table and its actual `delim`/`header`/`nullstr` options
 (`VgiCatalogQueryTest.scanReadsAFormatBranchCsvFileWithOptions`) — but NOT `catalog
@@ -793,6 +799,58 @@ split-capable function, `split_sequence(30, 6)`, real result values checked row-
 `VgiCatalog.listProcedures`/`.loadProcedure`. Tests: `VgiCatalogQueryTest
 .callsARealTableFunctionViaCallSyntax` / `.callsATableFunctionUnqualifiedViaDefaultSchema` (live,
 real worker) — no curated conformance test, since no real corpus file uses this calling shape.
+
+---
+
+### 13. Native scan-function delegation (`read_parquet` / `read_csv` / `iceberg_scan`)
+**Status:** ✅ Done — `read_parquet` confirmed live, `read_csv`/`iceberg_scan` unverified (no known
+worker delegates to either)
+
+**What it is:** found live, not from the corpus — testing the public example workers from
+[query.farm/vgi](https://query.farm/vgi) for a README rewrite, the Overture Maps one failed with
+`FunctionNotFoundError: Unknown function 'read_parquet'`. Not a worker bug: VGI's own **native
+scan-function delegation** mechanism — a FUNCTION branch's `function_name` can name a well-known
+reader (`read_parquet`, `read_csv`, `iceberg_scan`) instead of a function the worker actually hosts,
+telling the calling engine to run that reader itself (the DuckDB C++ extension resolves this against
+its own function catalog before ever treating it as an RPC target). This connector never implemented
+it — every function name got RPC-bound unconditionally — so a worker that ships no data at all
+(Overture's own: every table delegates to `read_parquet`) always failed. Distinct from item 11's
+FORMAT branches above, despite the surface similarity ("native file reading, no RPC") — item 11 is a
+worker EXPLICITLY declaring a format branch (`format_name`/`locations`); this is a FUNCTION branch
+whose name HAPPENS to be a DuckDB built-in, a different wire concept entirely, and item 11's own
+"delegating to `spark.read.format(...)` doesn't fit this connector's model" finding doesn't apply
+here — that finding was about delegating FROM WITHIN a `PartitionReader` running on an executor with
+no `SparkSession`; this instead swaps the WHOLE `Table` at `VgiCatalog.loadTable` time (driver-side,
+where a `SparkSession` genuinely is available), before `VgiTable`/`VgiScanBuilder`/`VgiScan` ever get
+involved.
+
+**What shipped:** new `VgiNativeScanBranch` (`VgiBranch`'s third sealed variant); `VgiCatalog
+.resolveBranches` builds one instead of an ordinary `VgiScanBranch` whenever a FUNCTION branch's
+`function_name` is a known native target; `VgiCatalog.loadTable` intercepts a table resolving to
+exactly one such branch and returns Spark's own real `ParquetDataSourceV2`/`CSVDataSourceV2`/
+Iceberg's `IcebergSource`-built `Table` directly via `TableProvider`'s three base methods
+(`inferSchema`/`inferPartitioning`/`getTable`) — real distributed pushdown, nothing hand-rolled. A
+mixed multi-branch table (native + real) is refused (`VgiScan.planInputPartitions`'s sealed switch).
+New catalog config key `acknowledge-native-scan-required-filters` gates a natively-delegated table
+that declares `TableInfo.required_filters` — Spark's native Table has no hook into that VGI concept
+at all, so `VgiNativeScanResolver` refuses without it. Iceberg is a new `compileOnly` dependency
+(`iceberg-spark-runtime-4.0_2.13:1.11.0` — no build targets Spark 4.2 yet), never eagerly referenced
+(a missing jar surfaces as a clear, caught error, not a class-loading crash affecting unrelated
+tables). Ported from `~/Development/vgi-polars`'s own identical fix (`_native_scan.py`, found first
+against this exact same Overture worker) — same conservative-named-argument-mapping philosophy
+(refuse on anything unmapped, never guess).
+
+**Unlocks:** the underlying CAPABILITY, confirmed live against a real worker — see `CLAUDE.md`'s own
+"Added: native scan-function delegation" writeup for the full verification (real Overture Maps rows
+back through `docker-spark`). No sqllogictest corpus file exercises this (DuckDB's own `.test` files
+use real workers with real function catalogs, not a native-delegating one), so zero sweep-count
+payoff, same shape as item 12's `CALL` work.
+
+**Verification:** `connector/src/main/java/farm/query/vgispark/branch/VgiNativeScanBranch.java`;
+`connector/.../scan/VgiNativeScanResolver.java`; `VgiCatalog.resolveBranches`/`.loadTable`;
+`VgiScan.planInputPartitions`'s new refusal arm. Test: `VgiNativeScanResolverTest` (synthetic
+arguments, no worker — real local-file round trips for `read_parquet`/`read_csv`, argument-validation
+and missing-Iceberg-jar coverage for all three targets).
 
 ---
 

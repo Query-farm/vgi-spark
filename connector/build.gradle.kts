@@ -41,6 +41,16 @@ dependencies {
     // module sees the table_function_plan client additions.
     implementation("farm.query:vgi:0.27.0")
 
+    // Iceberg's Spark integration — needed only for VgiNativeScanResolver's
+    // iceberg_scan native-delegation handler (see that class's own javadoc).
+    // compileOnly, same tier as Spark itself: an operator wanting
+    // iceberg_scan delegation adds this jar to their own cluster; it is NOT
+    // bundled into assembleDeployDir's output. No iceberg-spark-runtime build
+    // targets Spark 4.2 yet (confirmed against Maven Central's search API,
+    // 2026-08-28) -- 4.0_2.13 is the closest available and is what's used
+    // here; re-pin to a 4.2-specific build once/if one is published.
+    compileOnly("org.apache.iceberg:iceberg-spark-runtime-4.0_2.13:1.11.0")
+
     // Real Spark jars for tests — a local SparkSession is how this connector's
     // own correctness is verified end to end (see connector/src/test).
     testImplementation("org.apache.spark:spark-sql_$scalaBinaryVersion:$sparkVersion")

@@ -113,6 +113,18 @@ import java.util.Map;
  * @param implementationVersion a requested worker implementation version
  *        sent as {@code CatalogAttachRequest.implementation_version}, or
  *        {@code null} to request none
+ * @param acknowledgeNativeScanRequiredFilters whether this catalog acknowledges
+ *        responsibility for enforcing {@code TableInfo.required_filters}
+ *        itself on a natively-delegating table (see {@code
+ *        farm.query.vgispark.scan.VgiNativeScanResolver}'s own javadoc) —
+ *        {@code false} by default. Spark's own real Parquet/CSV/Iceberg
+ *        {@code Table} (what a {@code read_parquet}/{@code read_csv}/{@code
+ *        iceberg_scan}-delegating table resolves to) has no hook into VGI's
+ *        required_filters cost-safety concept at all, so {@code
+ *        VgiNativeScanResolver} refuses such a table outright unless this is
+ *        set — coarser than a per-query opt-in (Spark's {@code
+ *        TableCatalog.loadTable} has no per-call site to attach one), but the
+ *        closest real analog given that constraint
  * @param attachOptions custom, worker-declared ATTACH-time options (VGI's
  *        {@code AttachOptionSpec} mechanism — see that class's own javadoc),
  *        sent as {@code CatalogAttachRequest.options}. Every value travels
@@ -140,6 +152,7 @@ public record VgiCatalogConfig(
         String launcherStateDir,
         String dataVersionSpec,
         String implementationVersion,
+        boolean acknowledgeNativeScanRequiredFilters,
         Map<String, String> attachOptions) implements java.io.Serializable {
 
     /**
@@ -172,6 +185,7 @@ public record VgiCatalogConfig(
                 + ", launcherStateDir=" + launcherStateDir
                 + ", dataVersionSpec=" + dataVersionSpec
                 + ", implementationVersion=" + implementationVersion
+                + ", acknowledgeNativeScanRequiredFilters=" + acknowledgeNativeScanRequiredFilters
                 + ", attachOptions=" + redactedAttachOptions()
                 + "]";
     }
@@ -248,6 +262,8 @@ public record VgiCatalogConfig(
 
         String dataVersionSpec = options.get("data-version-spec");
         String implementationVersion = options.get("implementation-version");
+        boolean acknowledgeNativeScanRequiredFilters =
+                options.getBoolean("acknowledge-native-scan-required-filters", false);
 
         Map<String, String> attachOptions = new LinkedHashMap<>();
         String prefix = "attach-option.";
@@ -268,7 +284,7 @@ public record VgiCatalogConfig(
         return new VgiCatalogConfig(location, catalogName, connections, targetSplitBytes, minSplits,
                 maxSplitsPerResponse, connectionAcquireTimeoutMillis, maxPlanPages, httpBearerToken,
                 launcherEnabled, launcherIdleTimeoutSeconds, launcherStateDir, dataVersionSpec,
-                implementationVersion, Map.copyOf(attachOptions));
+                implementationVersion, acknowledgeNativeScanRequiredFilters, Map.copyOf(attachOptions));
     }
 
     /**

@@ -13,6 +13,7 @@ import farm.query.vgispark.VgiCatalogConfig;
 import farm.query.vgispark.VgiTable;
 import farm.query.vgispark.branch.VgiBranch;
 import farm.query.vgispark.branch.VgiFormatScanBranch;
+import farm.query.vgispark.branch.VgiNativeScanBranch;
 import farm.query.vgispark.branch.VgiScanBranch;
 import farm.query.vgispark.client.VgiWorkerClient;
 import org.apache.arrow.vector.types.pojo.ArrowType;
@@ -280,6 +281,22 @@ public final class VgiScan implements Scan, Batch, SupportsReportStatistics {
             switch (branch) {
                 case VgiScanBranch fn -> partitions.addAll(planBranchPartitions(fn));
                 case VgiFormatScanBranch fmt -> partitions.addAll(planFormatBranchPartitions(fmt));
+                // A single native-delegating branch never reaches VgiScan at
+                // all -- VgiCatalog.loadTable intercepts it and returns
+                // Spark's own real Table directly (see VgiNativeScanBranch's
+                // own javadoc). This arm only fires for a MIXED multi-branch
+                // table (a native branch alongside a real function/CSV
+                // branch), which has no established way to union rows from a
+                // Spark-native Scan with rows from this VgiScan -- refused,
+                // matching every other not-yet-supported branch shape's
+                // "fail closed, loudly" treatment (see VgiCatalog
+                // .resolveBranches).
+                case VgiNativeScanBranch nat -> throw new UnsupportedOperationException(
+                        "table '" + table.schemaName() + "." + table.tableName() + "': mixes a native-"
+                                + "delegating branch (" + nat.functionName() + ") with a real function/CSV "
+                                + "branch, which vgi-spark doesn't support scanning yet -- a table that "
+                                + "resolves to exactly one native-delegating branch is handled entirely "
+                                + "outside VgiScan instead (see VgiNativeScanBranch's own javadoc)");
             }
         }
         return partitions.toArray(new InputPartition[0]);

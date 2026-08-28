@@ -112,12 +112,34 @@ Set per catalog as `spark.sql.catalog.<name>.<key>`:
 | `data-version-spec` | no | Requests a specific `catalog_attach` data version; the worker resolves and reports back what it actually selected (see `VgiWorkerClient#resolvedDataVersion`). |
 | `implementation-version` | no | Requests a specific worker implementation version at attach time. |
 | `attach-option.<name>` | no | A custom, worker-declared ATTACH option (VGI's `AttachOptionSpec` mechanism). Values travel as plain UTF-8 strings only — Spark's catalog config has no type-disambiguation mechanism the way DuckDB's typed `ATTACH (opt 42, ...)` SQL clause does. |
+| `acknowledge-native-scan-required-filters` | no (default `false`) | Required to read a table that natively delegates to `read_parquet`/`read_csv`/`iceberg_scan` (see "Native scan-function delegation" below) **and** declares `required_filters` — Spark's own native reader has no hook into that VGI cost-safety concept, so such a table is refused until you set this, confirming you'll apply the equivalent filter(s) yourself. |
 
 Note: `launch:` (whether explicit or the bare-command default above) needs a
 JDK 22+ runtime — it uses the Foreign Function & Memory API for its
 `flock`/`geteuid` calls. On an older JDK, an explicit `launch:` location
 fails outright; a bare-command default location gracefully falls back to a
 plain per-connection subprocess spawn instead.
+
+### Native scan-function delegation
+
+A table whose worker names `read_parquet`, `read_csv`, or `iceberg_scan`
+instead of a function it actually hosts (VGI's own mechanism for a worker
+that ships no data of its own — e.g. a pure-metadata catalog pointing at a
+public S3 GeoParquet dataset) is read via **Spark's own real Parquet/CSV/
+Iceberg reader**, not RPC-bound to the worker — real distributed pushdown,
+not anything hand-rolled. Confirmed live against a real public worker
+(`vgi-overture-maps-typescript`); see `acknowledge-native-scan-required-filters`
+above for the one config knob it needs.
+
+**Optional dependency**: `iceberg_scan` delegation needs
+`iceberg-spark-runtime` (this connector compiles against
+`iceberg-spark-runtime-4.0_2.13:1.11.0` — the closest available build, no
+release targets Spark 4.2 yet) on the Spark cluster's own classpath, the
+same tier Spark itself is provided at — **not** bundled into
+`assembleDeployDir`'s output. A table that needs it without the jar present
+fails with a clear, actionable error naming what's missing, not a bare
+classpath crash. `read_parquet`/`read_csv` need nothing extra — both use
+Spark's own built-in file source, already on every Spark cluster.
 
 ## Building and testing
 

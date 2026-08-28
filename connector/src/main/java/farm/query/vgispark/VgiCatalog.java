@@ -14,11 +14,13 @@ import farm.query.vgispark.branch.FormatOptionsDecoder;
 import farm.query.vgispark.branch.ScanBranchesDecoder;
 import farm.query.vgispark.branch.VgiBranch;
 import farm.query.vgispark.branch.VgiFormatScanBranch;
+import farm.query.vgispark.branch.VgiNativeScanBranch;
 import farm.query.vgispark.branch.VgiScanBranch;
 import farm.query.vgispark.client.VgiWorkerClient;
 import farm.query.vgispark.function.VgiAggregateFunctions;
 import farm.query.vgispark.function.VgiScalarFunctions;
 import farm.query.vgispark.procedure.VgiTableProcedures;
+import farm.query.vgispark.scan.VgiNativeScanResolver;
 import org.apache.spark.sql.catalyst.analysis.NamespaceAlreadyExistsException;
 import org.apache.spark.sql.catalyst.analysis.NoSuchFunctionException;
 import org.apache.spark.sql.catalyst.analysis.NoSuchNamespaceException;
@@ -234,6 +236,21 @@ public final class VgiCatalog implements TableCatalog, SupportsNamespaces, Funct
         TableInfo info = TableInfoDecoder.decode(tableResp.items().get(0));
         List<VgiBranch> branches = resolveBranches(schemaName, tableName, atUnit, atValue);
 
+        // Native scan-function delegation (VgiNativeScanBranch's own javadoc):
+        // a table that resolves to EXACTLY ONE native-delegating branch skips
+        // VgiTable/VgiScanBuilder/VgiScan entirely — Spark's own real
+        // Parquet/CSV/Iceberg Table takes over completely, with real
+        // pushdown, not anything hand-rolled. A MIXED multi-branch table
+        // (this alongside a real function/CSV branch) falls through to the
+        // ordinary VgiTable path below, where VgiScan.planInputPartitions's
+        // own sealed switch refuses it explicitly (see that method) — VGI's
+        // multi-branch model has no established way to union rows from a
+        // Spark-native Scan with rows from a VgiScan-planned one.
+        if (branches.size() == 1 && branches.get(0) instanceof VgiNativeScanBranch nativeBranch) {
+            return VgiNativeScanResolver.resolve(info.schema_name() + "." + info.name(), nativeBranch,
+                    info.required_filters(), config.acknowledgeNativeScanRequiredFilters());
+        }
+
         return new VgiTable(info.schema_name(), info.name(), branches,
                 info.columns(), info.cardinality_estimate(), atUnit, atValue, info.required_filters(),
                 client, config);
@@ -253,6 +270,14 @@ public final class VgiCatalog implements TableCatalog, SupportsNamespaces, Funct
      * "csv"} (parquet/delta/iceberg — item 11's own scope note), or any
      * branch declaring a non-empty {@code branch_filter} (translating VGI's
      * branch-filter grammar into a per-branch pushdown isn't wired up yet).
+     *
+     * <p>A FUNCTION branch (either arm below) whose {@code function_name} is
+     * a known native-delegation target ({@code read_parquet}, {@code
+     * read_csv}, {@code iceberg_scan}) resolves to a {@link
+     * VgiNativeScanBranch} instead of an ordinary {@link VgiScanBranch} — see
+     * {@link VgiNativeScanBranch}'s own javadoc and {@code loadTable}, which
+     * intercepts a single-native-branch result before ever constructing a
+     * {@link VgiTable}.
      */
     private List<VgiBranch> resolveBranches(String schemaName, String tableName, String atUnit, String atValue) {
         byte[] branchesResponse;
@@ -264,6 +289,10 @@ public final class VgiCatalog implements TableCatalog, SupportsNamespaces, Funct
             TableScanFunctionGetResponse scan = client.withConnection(a ->
                     a.service().catalog_table_scan_function_get(
                             a.handle(), schemaName, tableName, atUnit, atValue, null, null));
+            if (VgiNativeScanResolver.isNativeScanFunction(scan.function_name())) {
+                return List.of(new VgiNativeScanBranch(
+                        scan.function_name(), ScanFunctionArguments.decode(scan.arguments())));
+            }
             byte[] bindArguments = ScanFunctionArguments.toBindArguments(scan.arguments());
             return List.of(new VgiScanBranch(scan.function_name(), bindArguments));
         }
@@ -281,8 +310,13 @@ public final class VgiCatalog implements TableCatalog, SupportsNamespaces, Funct
             }
             switch (branch.kind()) {
                 case FUNCTION -> {
-                    byte[] bindArguments = ScanFunctionArguments.toBindArguments(branch.arguments());
-                    branches.add(new VgiScanBranch(branch.functionName(), bindArguments));
+                    if (VgiNativeScanResolver.isNativeScanFunction(branch.functionName())) {
+                        branches.add(new VgiNativeScanBranch(
+                                branch.functionName(), ScanFunctionArguments.decode(branch.arguments())));
+                    } else {
+                        byte[] bindArguments = ScanFunctionArguments.toBindArguments(branch.arguments());
+                        branches.add(new VgiScanBranch(branch.functionName(), bindArguments));
+                    }
                 }
                 case FORMAT -> {
                     if (!"csv".equalsIgnoreCase(branch.formatName())) {

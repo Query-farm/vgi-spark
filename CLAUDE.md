@@ -306,6 +306,125 @@ fix populates every expected jar (including Arrow/Netty staying correctly
 excluded) on a clean build, then re-running the full Docker smoke test
 locally end to end (`100 | 4950`, same as the original manual verification).
 
+## Added: native scan-function delegation (2026-08-28)
+
+While testing the four public example workers from
+[query.farm/vgi](https://query.farm/vgi) live for a README rewrite, the
+Overture Maps one (`https://vgi-overture.rusty-bb6.workers.dev`) failed:
+
+```
+farm.query.vgirpc.RpcError: FunctionNotFoundError: Unknown function 'read_parquet'
+```
+
+Not a worker bug — VGI's own **native scan-function delegation** mechanism
+(`TableScanFunctionGetResponse.function_name`/a `ScanBranchesResult` FUNCTION
+branch's `function_name`): a worker can name `read_parquet`, `read_csv`, or
+`iceberg_scan` instead of a function it actually hosts, telling the *calling
+engine* to run that reader itself. The DuckDB C++ extension resolves this by
+checking its own function catalog before ever treating it as an RPC target.
+This connector never implemented it — every function name, native or not,
+got RPC-bound unconditionally — so a worker that ships no data at all
+(Overture's: every table delegates to `read_parquet` against Overture's
+public S3 GeoParquet) always failed.
+
+`~/Development/vgi-polars` hit and fixed the identical gap first (commits
+`d09dbc5`/`c8a1b38`/`59d182e`, found live against this exact same Overture
+worker) — a `_native_scan.py` registry translating `ScanFunctionResult` into
+`pl.scan_parquet`/`pl.scan_csv`/`pl.scan_iceberg`, bypassing the VGI RPC path
+entirely, with conservative per-function named-argument mapping (refuse on
+anything unmapped, never guess) and a `required_filters`-safety opt-in since
+normal enforcement has no hook into a natively-delegated scan. Ported here
+with the same discipline, adapted to Spark's shape:
+
+- **New `VgiBranch` variant, `VgiNativeScanBranch`** — `VgiCatalog
+  .resolveBranches` builds this instead of an ordinary `VgiScanBranch`
+  whenever a FUNCTION branch's `function_name` (case-insensitive) is
+  `read_parquet`/`read_csv`/`iceberg_scan` (both the legacy single-function
+  fallback arm and the multi-branch decode loop's FUNCTION arm needed the
+  same check).
+- **`VgiNativeScanResolver`** (new, `connector/.../scan/`) — the registry +
+  per-target translation, the Java analog of `_native_scan.py`. Deliberately
+  uses only `TableProvider`'s three base methods (`inferSchema`/
+  `inferPartitioning`/`getTable(schema, partitioning, props)`) rather than
+  each format's own convenience shortcut — Spark's real, public connector
+  SPI, not an internal one, and the same three-call sequence works uniformly
+  across all three targets. `"path"` is the one option key every one of them
+  resolves a bare path/table-location from — confirmed via `javap -c` on
+  `FileDataSourceV2.getPaths` (reads `options.get("path")`) and via Iceberg's
+  own documented `spark.read.format("iceberg").load(path)` usage.
+- **`VgiCatalog.loadTable` intercepts** a table that resolves to exactly one
+  `VgiNativeScanBranch`: hands off to `VgiNativeScanResolver` and returns
+  Spark's own real Parquet/CSV/Iceberg `Table` directly, instead of
+  constructing `VgiTable`. `VgiTable`/`VgiScanBuilder`/`VgiScan`/
+  `VgiPartitionReader` are never involved — Spark's own file/Iceberg source
+  machinery does the actual reading, with real distributed pushdown, not
+  anything hand-rolled (the same reason `vgi-polars` calls `pl.scan_parquet`
+  instead of writing its own reader). A **mixed** multi-branch table (a
+  native branch alongside a real function/CSV branch) is refused — `VgiScan
+  .planInputPartitions`'s sealed-interface switch gets a compiler-forced
+  `case VgiNativeScanBranch` arm that only fires for this rare case, since
+  the pure single-native-branch case is intercepted earlier and never
+  reaches `VgiScan` at all.
+- **`required_filters` safety gate**: the normal enforcement
+  (`VgiScanBuilder.checkRequiredFilters`) never runs for a natively-delegated
+  table (bypassed entirely along with the rest of the `VgiScan` pipeline) —
+  same problem `vgi-polars` hit. New catalog config key,
+  `acknowledge-native-scan-required-filters` (default `false`) — coarser
+  than `vgi-polars`' per-call `acknowledge_required_filters` kwarg (Spark's
+  `TableCatalog.loadTable` has no per-query call site to attach one to), but
+  the closest real analog given that constraint. `VgiNativeScanResolver
+  .resolve` refuses outright without it, naming the table and the
+  required-filter columns.
+- **Iceberg is a new `compileOnly` dependency**
+  (`org.apache.iceberg:iceberg-spark-runtime-4.0_2.13:1.11.0`) — same tier as
+  Spark itself, NOT bundled into `assembleDeployDir`'s output. No
+  `iceberg-spark-runtime` build targets Spark 4.2 yet (confirmed against
+  Maven Central's search API, zero results for `-4.2_2.13`); `4.0_2.13` is
+  the closest available. Every reference to an Iceberg class in
+  `VgiNativeScanResolver` is deliberately confined to code paths that only
+  execute when an actual `iceberg_scan` branch is resolved — a lambda body
+  (`() -> new IcebergSource()`), not a bare method reference
+  (`IcebergSource::new`), for the provider-construction entry in its
+  `TARGETS` map: a bare method reference would force the JVM to resolve
+  `IcebergSource` while building that map (a real, verified JVM subtlety —
+  `invokedynamic`'s bootstrap arguments for a method REFERENCE need the
+  target class resolved at the point the map literal is evaluated, but for a
+  lambda BODY the `new IcebergSource()` call lives inside a synthetic method
+  that's only linked when actually invoked), which would poison the whole
+  class — including `read_parquet`, which needs no Iceberg jar at all — the
+  first time ANY native-delegating table is resolved on a cluster without
+  the Iceberg jar. A missing jar now surfaces as a caught
+  `NoClassDefFoundError`, wrapped in a clear `IllegalStateException` naming
+  the table and what to add — regression-tested directly (
+  `VgiNativeScanResolverTest.icebergScanWithoutTheRuntimeJarFailsWithAClearError`,
+  which relies on `iceberg-spark-runtime` genuinely being absent from the
+  test's own runtime classpath, since it's `compileOnly`).
+
+**`read_parquet` confirmed live end to end, twice** — once as the original
+repro (`FunctionNotFoundError` on the old code), once after the fix,
+rebuilding `connector/build/deploy/` and the local `docker-spark` image and
+re-running the exact Overture query (`bbox`/`categories.primary` filters,
+matching the DuckDB example on query.farm/vgi) via `docker run ... spark-shell
+--conf spark.sql.catalog.overture.acknowledge-native-scan-required-filters=true`.
+First attempt hit a real, unrelated, expected gap — `UnsupportedFileSystemException:
+No FileSystem for scheme "s3"` (this Docker image's own Spark tarball has no
+S3 filesystem support installed, a separate deployment concern, not a
+vgi-spark bug) — adding `--packages org.apache.hadoop:hadoop-aws:3.5.0` (matching
+the image's own bundled `hadoop-client` version) plus anonymous S3 credentials
+got real rows back: 5 real Overture church records (`Berean Baptist Church`,
+etc.), matching the shape of query.farm's own published example. `read_csv`/
+`iceberg_scan` have no known live-delegating worker anywhere (same gap
+`vgi-polars` documented) — shipped with unit coverage only (`VgiNativeScanResolverTest`,
+synthetic arguments, no worker), documented as unverified against a real
+worker.
+
+Not proposing a new *automated* CI test against the public Overture
+endpoint — coupling CI's reliability to a third-party demo service's uptime
+is a real risk this connector's existing test suite deliberately avoids
+(every existing test runs against a local subprocess/socket worker). The
+live check above is a one-time manual verification, same as this section's
+own writeup.
+
 ## Open bugs (not yet fixed)
 
 - **`opt_time` / Arrow `Time(MICROSECOND)` has no Spark mapping.**
