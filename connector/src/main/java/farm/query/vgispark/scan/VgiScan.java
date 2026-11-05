@@ -22,6 +22,7 @@ import farm.query.vgispark.branch.VgiScanBranch;
 import farm.query.vgispark.client.VgiWorkerClient;
 import farm.query.vgispark.filter.VgiFilterTranslator;
 import farm.query.vgispark.types.ArrowSchemaCodec;
+import farm.query.vgispark.types.VgiTypeMapping;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
@@ -49,7 +50,9 @@ import org.apache.spark.sql.types.StructType;
 import org.apache.spark.unsafe.types.UTF8String;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -97,6 +100,11 @@ public final class VgiScan implements Scan, Batch, SupportsReportStatistics, Sup
     private record BranchPlan(List<InputPartition> partitions, Expression[] groupingKeys) {}
 
     record DecodedGrouping(Expression[] expressions, DataType[] keyTypes) {}
+
+    record CoalescedPartitions(
+            List<VgiInputPartition> partitions,
+            List<InternalRow> keys,
+            boolean groupingValid) {}
 
     /**
      * @param client the pooled connection to this catalog's VGI worker
@@ -437,9 +445,13 @@ public final class VgiScan implements Scan, Batch, SupportsReportStatistics, Sup
         DecodedGrouping grouping = null;
         byte[] groupingWire = null;
         boolean groupingValid = true;
-        byte[] cursor = null;
+        List<byte[]> pendingCursors = new ArrayList<>();
+        pendingCursors.add(null);
+        int cursorIndex = 0;
         int pagesFetched = 0;
-        while (true) {
+        Long maxWorkers = null;
+        while (cursorIndex < pendingCursors.size()) {
+            byte[] cursor = pendingCursors.get(cursorIndex++);
             pagesFetched++;
             if (pagesFetched > config.maxPlanPages()) {
                 // Stopping early and returning what was already collected
@@ -474,29 +486,42 @@ public final class VgiScan implements Scan, Batch, SupportsReportStatistics, Sup
 
             if (pagesFetched == 1) {
                 groupingWire = response.key_grouping();
-                grouping = decodeGrouping(groupingWire, readSchema);
+                grouping = decodeGrouping(
+                        groupingWire, authoritativeSchema, logicalFields, readSchema);
                 groupingValid = grouping != null;
-            } else if (!java.util.Arrays.equals(groupingWire, response.key_grouping())) {
-                groupingValid = false;
+                maxWorkers = response.max_workers();
+            } else {
+                if (!java.util.Arrays.equals(groupingWire, response.key_grouping())) {
+                    groupingValid = false;
+                }
             }
 
-            boolean sawSentinel = false;
+            List<byte[]> nextCursors = response.next_cursors();
+            boolean hasContinuation = nextCursors != null
+                    && nextCursors.stream().anyMatch(value -> value != null && value.length != 0);
             for (byte[] blob : response.splits()) {
                 ScanSplit split = RecordCodec.deserializeFromBytes(blob, ScanSplit.class);
                 if (split.token().length == 0) {
-                    // The not-split-capable sentinel: exactly one such split,
-                    // standing for the whole scan. Stop here regardless of
-                    // next_cursors.
+                    boolean distributionClaim = (response.key_grouping() != null
+                                    && response.key_grouping().length != 0)
+                            || (response.range_partitioning() != null
+                                    && response.range_partitioning().length != 0)
+                            || (response.partitioning() != null && !response.partitioning().isEmpty());
+                    if (response.splits().size() != 1 || !partitions.isEmpty()
+                            || hasContinuation || distributionClaim) {
+                        throw new IllegalArgumentException(
+                                "empty-token scan sentinel must be the sole split and cannot carry "
+                                        + "continuations or distribution metadata");
+                    }
                     partitions.add(new VgiInputPartition(bindCall, bindOpaqueData,
-                            boundOutputSchema[0], branchPushdownFilters, new byte[0], 0L, new String[0]));
+                            boundOutputSchema[0], branchPushdownFilters, List.of(), 0L, new String[0]));
                     partitionKeys.add(null);
                     groupingValid = false;
-                    sawSentinel = true;
-                    break;
+                    continue;
                 }
                 long estimatedBytes = split.estimated_bytes() == null ? 0L : split.estimated_bytes();
                 partitions.add(new VgiInputPartition(bindCall, bindOpaqueData,
-                        boundOutputSchema[0], branchPushdownFilters, split.token(),
+                        boundOutputSchema[0], branchPushdownFilters, List.of(split.token()),
                         estimatedBytes, resolveAddresses(response, split)));
                 try {
                     partitionKeys.add(grouping == null
@@ -507,19 +532,24 @@ public final class VgiScan implements Scan, Batch, SupportsReportStatistics, Sup
                     groupingValid = false;
                 }
             }
-            if (sawSentinel) break;
-
-            List<byte[]> nextCursors = response.next_cursors();
-            if (nextCursors == null || nextCursors.isEmpty()) {
-                break;
+            if (nextCursors != null) {
+                nextCursors.stream()
+                        .filter(value -> value != null && value.length != 0)
+                        .forEach(pendingCursors::add);
             }
-            // v1 follows only the first continuation cursor — see
-            // PlanResponse.next_cursors's own javadoc on why more than one is
-            // safe to ignore rather than fan out further here.
-            cursor = nextCursors.get(0);
         }
-        if (!groupingValid || grouping == null || partitions.isEmpty()
-                || partitionKeys.stream().anyMatch(java.util.Objects::isNull)) {
+
+        boolean keysUsable = groupingValid && grouping != null && !partitions.isEmpty()
+                && partitionKeys.stream().noneMatch(java.util.Objects::isNull);
+        if (maxWorkers != null && maxWorkers > 0 && partitions.size() > maxWorkers) {
+            int workerCap = maxWorkers > Integer.MAX_VALUE ? Integer.MAX_VALUE : maxWorkers.intValue();
+            CoalescedPartitions coalesced = coalesceForMaxWorkers(
+                    partitions, partitionKeys, workerCap, keysUsable);
+            partitions = coalesced.partitions();
+            partitionKeys = coalesced.keys();
+            keysUsable = coalesced.groupingValid();
+        }
+        if (!keysUsable) {
             List<InputPartition> unknown = new ArrayList<>(partitions.size());
             unknown.addAll(partitions);
             return new BranchPlan(unknown, null);
@@ -531,9 +561,15 @@ public final class VgiScan implements Scan, Batch, SupportsReportStatistics, Sup
         return new BranchPlan(keyed, grouping.expressions());
     }
 
-    static DecodedGrouping decodeGrouping(byte[] bytes, StructType outputSchema) {
+    static DecodedGrouping decodeGrouping(
+            byte[] bytes,
+            Schema authoritativeSchema,
+            List<Field> logicalFields,
+            StructType outputSchema) {
         if (bytes == null || bytes.length == 0) return null;
         try {
+            if (authoritativeSchema == null
+                    || authoritativeSchema.getFields().size() != logicalFields.size()) return null;
             KeyGrouping grouping = RecordCodec.deserializeFromBytes(bytes, KeyGrouping.class);
             if (grouping.keys() == null || grouping.keys().isEmpty()) return null;
             Expression[] keys = new Expression[grouping.keys().size()];
@@ -556,15 +592,98 @@ public final class VgiScan implements Scan, Batch, SupportsReportStatistics, Sup
                         || path.components().stream().anyMatch(String::isEmpty)) {
                     return null;
                 }
-                DataType keyType = resolvePath(outputSchema, path.components());
-                if (keyType == null) return null;
-                keys[i] = Expressions.identity(quotedReference(path.components()));
+                String remoteTop = path.components().get(0);
+                int ordinal = -1;
+                for (int candidate = 0; candidate < authoritativeSchema.getFields().size(); candidate++) {
+                    if (authoritativeSchema.getFields().get(candidate).getName().equals(remoteTop)) {
+                        if (ordinal != -1) return null;
+                        ordinal = candidate;
+                    }
+                }
+                if (ordinal == -1) return null;
+                List<String> publicPath = new ArrayList<>(path.components());
+                publicPath.set(0, logicalFields.get(ordinal).getName());
+                DataType keyType = resolvePath(outputSchema, publicPath);
+                DataType remoteType = VgiTypeMapping.toSparkType(
+                        authoritativeSchema.getFields().get(ordinal));
+                remoteType = resolveNestedPath(remoteType, path.components().subList(1, path.components().size()));
+                if (keyType == null || remoteType == null || !keyType.equals(remoteType)) return null;
+                keys[i] = Expressions.identity(quotedReference(publicPath));
                 keyTypes[i] = keyType;
             }
             return new DecodedGrouping(keys, keyTypes);
         } catch (RuntimeException invalidMetadata) {
             return null;
         }
+    }
+
+    private static DataType resolveNestedPath(DataType type, List<String> components) {
+        DataType current = type;
+        for (String component : components) {
+            if (!(current instanceof StructType struct)) return null;
+            StructField match = null;
+            for (StructField field : struct.fields()) {
+                if (field.name().equals(component)) {
+                    if (match != null) return null;
+                    match = field;
+                }
+            }
+            if (match == null) return null;
+            current = match.dataType();
+        }
+        return current;
+    }
+
+    static CoalescedPartitions coalesceForMaxWorkers(
+            List<VgiInputPartition> partitions,
+            List<InternalRow> keys,
+            int maxWorkers,
+            boolean groupingValid) {
+        if (maxWorkers <= 0 || partitions.size() <= maxWorkers) {
+            return new CoalescedPartitions(partitions, keys, groupingValid);
+        }
+        if (groupingValid) {
+            Map<InternalRow, List<VgiInputPartition>> byKey = new LinkedHashMap<>();
+            for (int i = 0; i < partitions.size(); i++) {
+                byKey.computeIfAbsent(keys.get(i), ignored -> new ArrayList<>()).add(partitions.get(i));
+            }
+            if (byKey.size() <= maxWorkers) {
+                List<VgiInputPartition> merged = new ArrayList<>(byKey.size());
+                List<InternalRow> mergedKeys = new ArrayList<>(byKey.size());
+                byKey.forEach((key, values) -> {
+                    merged.add(mergePartitions(values));
+                    mergedKeys.add(key);
+                });
+                return new CoalescedPartitions(merged, mergedKeys, true);
+            }
+        }
+
+        List<List<VgiInputPartition>> buckets = new ArrayList<>(maxWorkers);
+        for (int i = 0; i < maxWorkers; i++) buckets.add(new ArrayList<>());
+        for (int i = 0; i < partitions.size(); i++) {
+            buckets.get(i % maxWorkers).add(partitions.get(i));
+        }
+        List<VgiInputPartition> merged = buckets.stream()
+                .filter(bucket -> !bucket.isEmpty())
+                .map(VgiScan::mergePartitions)
+                .toList();
+        return new CoalescedPartitions(merged, java.util.Collections.nCopies(merged.size(), null), false);
+    }
+
+    private static VgiInputPartition mergePartitions(List<VgiInputPartition> partitions) {
+        VgiInputPartition first = partitions.get(0);
+        List<byte[]> tokens = partitions.stream().flatMap(value -> value.tokens().stream()).toList();
+        long estimatedBytes = 0;
+        LinkedHashSet<String> addresses = new LinkedHashSet<>();
+        for (VgiInputPartition partition : partitions) {
+            long next = Math.max(0, partition.estimatedBytes());
+            estimatedBytes = next > Long.MAX_VALUE - estimatedBytes
+                    ? Long.MAX_VALUE : estimatedBytes + next;
+            addresses.addAll(Arrays.asList(partition.addresses()));
+        }
+        return new VgiInputPartition(
+                first.bindCall(), first.bindOpaqueData(), first.outputSchema(), first.pushdownFilters(),
+                tokens, estimatedBytes, addresses.toArray(new String[0]));
     }
 
     private static DataType resolvePath(StructType schema, List<String> components) {

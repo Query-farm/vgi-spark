@@ -109,13 +109,25 @@ class VgiSplitParallelismTest {
         @Override public PlanResult plan(TableBindParams params, PlanRequest request) {
             long n = argLong(params, "n");
             long splits = argLong(params, "splits");
-            List<ScanSplit> out = new ArrayList<>();
+            List<ScanSplit> all = new ArrayList<>();
             for (Range r : evenRanges(n, splits)) {
                 long rows = r.hi() - r.lo();
-                out.add(new ScanSplit(encode(r), new byte[0], rows, true, rows * 8,
+                all.add(new ScanSplit(encode(r), new byte[0], rows, true, rows * 8,
                         null, null, null, null, null));
             }
-            return PlanResult.of(out);
+            // Fan the enumeration out into two continuation branches. This
+            // catches clients that incorrectly follow only next_cursors[0].
+            if (request.cursor() == null || request.cursor().length == 0) {
+                return new PlanResult(List.of(all.get(0)),
+                        List.of(new byte[] {1}, new byte[] {2}),
+                        null, (long) all.size(), n, 2L);
+            }
+            int branch = Byte.toUnsignedInt(request.cursor()[0]);
+            List<ScanSplit> page = branch == 1
+                    ? all.subList(1, 3)
+                    : branch == 2 ? all.subList(3, all.size()) : List.of();
+            return new PlanResult(page, List.of(), null,
+                    (long) all.size(), n, 2L);
         }
 
         @Override public TableProducerState createProducer(TableInitParams params) {
