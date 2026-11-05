@@ -60,10 +60,16 @@ import java.util.NoSuchElementException;
 public final class VgiPartitionReader implements PartitionReader<ColumnarBatch> {
 
     private final VgiWorkerClient.Attached connection;
-    private final RpcStream<? extends StreamState> session;
+    private final VgiInputPartition partition;
+    private final byte[] tableOutputSchemaBytes;
+    private final byte[] pushdownFiltersBytes;
+    private final Long rowLimit;
     private final Schema arrowSchema;
     private final List<Integer> projectionIds;
 
+    private RpcStream<? extends StreamState> session;
+    private int nextTokenIndex;
+    private boolean primaryOpened;
     private ColumnarBatch currentBatch;
     private boolean finished;
 
@@ -84,26 +90,16 @@ public final class VgiPartitionReader implements PartitionReader<ColumnarBatch> 
             List<Integer> projectionIds, byte[] pushdownFiltersBytes, Long rowLimit) {
         this.arrowSchema = ArrowSchemaCodec.deserializeSchema(tableOutputSchemaBytes);
         this.projectionIds = projectionIds;
+        this.partition = partition;
+        this.tableOutputSchemaBytes = tableOutputSchemaBytes;
+        this.pushdownFiltersBytes = pushdownFiltersBytes;
+        this.rowLimit = rowLimit;
         this.connection = VgiWorkerClient.connect(config);
         boolean ok = false;
         try {
-            InitRequest initRequest = new InitRequest(
-                    partition.bindCall(),
-                    tableOutputSchemaBytes,
-                    partition.bindOpaqueData(),
-                    projectionIds,
-                    pushdownFiltersBytes,
-                    null,           // join_keys
-                    null,           // phase (producer mode)
-                    null,           // execution_id — primary init, worker mints one
-                    null,           // init_opaque_data
-                    null, null, null, null,     // order-by hint
-                    null, null,                 // tablesample hint
-                    null,           // finalize_state_id
-                    null,           // substream_id
-                    partition.token().length == 0 ? null : List.of(partition.token()),
-                    rowLimit);
-            this.session = connection.service().init(initRequest, null);
+            if (!openNextSession()) {
+                throw new IllegalArgumentException("VGI input partition had no redeemable scan");
+            }
             ok = true;
         } finally {
             if (!ok) closeConnectionQuietly();
@@ -114,14 +110,25 @@ public final class VgiPartitionReader implements PartitionReader<ColumnarBatch> 
     public boolean next() throws IOException {
         if (finished) return false;
         AnnotatedBatch batch;
-        try {
-            batch = session.tick();
-        } catch (NoSuchElementException endOfStream) {
-            finished = true;
-            currentBatch = null;
-            return false;
-        } catch (RuntimeException e) {
-            throw new IOException("VGI stream read failed", e);
+        while (true) {
+            try {
+                batch = session.tick();
+                break;
+            } catch (NoSuchElementException endOfStream) {
+                session.close();
+                session = null;
+                try {
+                    if (!openNextSession()) {
+                        finished = true;
+                        currentBatch = null;
+                        return false;
+                    }
+                } catch (RuntimeException e) {
+                    throw new IOException("opening the next VGI split stream failed", e);
+                }
+            } catch (RuntimeException e) {
+                throw new IOException("VGI stream read failed", e);
+            }
         }
         VectorSchemaRoot root = batch.root();
         List<Field> fields = projectionIds == null ? arrowSchema.getFields() : projectedFields();
@@ -131,6 +138,36 @@ public final class VgiPartitionReader implements PartitionReader<ColumnarBatch> 
             columns[i] = new ArrowColumnVector(vector);
         }
         currentBatch = new ColumnarBatch(columns, root.getRowCount());
+        return true;
+    }
+
+    private boolean openNextSession() {
+        List<byte[]> splitTokens;
+        if (partition.tokens().isEmpty()) {
+            if (primaryOpened) return false;
+            primaryOpened = true;
+            splitTokens = null;
+        } else {
+            if (nextTokenIndex >= partition.tokens().size()) return false;
+            splitTokens = List.of(partition.tokens().get(nextTokenIndex++));
+        }
+        InitRequest initRequest = new InitRequest(
+                partition.bindCall(),
+                tableOutputSchemaBytes,
+                partition.bindOpaqueData(),
+                projectionIds,
+                pushdownFiltersBytes,
+                null,           // join_keys
+                null,           // phase (producer mode)
+                null,           // execution_id — primary init, worker mints one
+                null,           // init_opaque_data
+                null, null, null, null,     // order-by hint
+                null, null,                 // tablesample hint
+                null,           // finalize_state_id
+                null,           // substream_id
+                splitTokens,
+                rowLimit);
+        session = connection.service().init(initRequest, null);
         return true;
     }
 
@@ -149,7 +186,7 @@ public final class VgiPartitionReader implements PartitionReader<ColumnarBatch> 
     @Override
     public void close() throws IOException {
         try {
-            session.close();
+            if (session != null) session.close();
         } finally {
             closeConnectionQuietly();
         }
