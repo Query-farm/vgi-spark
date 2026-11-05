@@ -6,6 +6,19 @@ worker protocol the `vgi` DuckDB extension and
 [`vgi-trino`](https://github.com/Query-farm/vgi-trino) attach to. One Spark
 catalog maps to one VGI `ATTACH`, the same granularity DuckDB and Trino use.
 
+## Protocol 3.1 partition grouping
+
+When every VGI split advertises an exact protocol 3.1 `key_value`, the connector
+reports Spark `KeyGroupedPartitioning` and exposes that tuple through
+`HasPartitionKey`. The initial portable profile supports parameter-free
+`vgi.identity/1` transforms, including nested identifiers represented as raw
+field-path components. Pagination must repeat byte-identical grouping metadata,
+and every branch of a multi-branch scan must use the same grouping.
+
+Missing keys, mixed branches, malformed metadata, and unsupported transforms
+conservatively produce `UnknownPartitioning`; they never become an inferred
+hash or Hive partitioning claim.
+
 ```scala
 spark.conf.set("spark.sql.catalog.vgi_example", "farm.query.vgispark.VgiCatalog")
 spark.conf.set("spark.sql.catalog.vgi_example.location",

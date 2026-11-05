@@ -6,9 +6,12 @@ import farm.query.vgi.client.ColumnStatisticsDecoder;
 import farm.query.vgi.client.EncodedPushdownFilters;
 import farm.query.vgi.protocol.BindRequest;
 import farm.query.vgi.protocol.BindResponse;
+import farm.query.vgi.protocol.FieldPath;
+import farm.query.vgi.protocol.KeyGrouping;
 import farm.query.vgi.protocol.PlanResponse;
 import farm.query.vgi.protocol.ScanSplit;
 import farm.query.vgi.protocol.TableFunctionPlanRequest;
+import farm.query.vgi.protocol.TransformSpec;
 import farm.query.vgirpc.marshal.RecordCodec;
 import farm.query.vgispark.VgiCatalogConfig;
 import farm.query.vgispark.VgiTable;
@@ -23,7 +26,9 @@ import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.spark.sql.connector.catalog.Column;
+import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.connector.expressions.Expressions;
+import org.apache.spark.sql.connector.expressions.Expression;
 import org.apache.spark.sql.connector.expressions.NamedReference;
 import org.apache.spark.sql.connector.expressions.filter.Predicate;
 import org.apache.spark.sql.connector.read.Batch;
@@ -32,8 +37,13 @@ import org.apache.spark.sql.connector.read.PartitionReaderFactory;
 import org.apache.spark.sql.connector.read.Scan;
 import org.apache.spark.sql.connector.read.Statistics;
 import org.apache.spark.sql.connector.read.SupportsReportStatistics;
+import org.apache.spark.sql.connector.read.SupportsReportPartitioning;
 import org.apache.spark.sql.connector.read.colstats.ColumnStatistics;
+import org.apache.spark.sql.connector.read.partitioning.KeyGroupedPartitioning;
+import org.apache.spark.sql.connector.read.partitioning.Partitioning;
+import org.apache.spark.sql.connector.read.partitioning.UnknownPartitioning;
 import org.apache.spark.sql.types.DataTypes;
+import org.apache.spark.sql.types.DataType;
 import org.apache.spark.sql.types.StructField;
 import org.apache.spark.sql.types.StructType;
 import org.apache.spark.unsafe.types.UTF8String;
@@ -64,7 +74,7 @@ import java.util.OptionalLong;
  * VgiCatalogConfig#maxPlanPages()} — see that field's own javadoc for why
  * exceeding it throws rather than silently returning a partial plan.
  */
-public final class VgiScan implements Scan, Batch, SupportsReportStatistics {
+public final class VgiScan implements Scan, Batch, SupportsReportStatistics, SupportsReportPartitioning {
 
     private final VgiWorkerClient client;
     private final VgiCatalogConfig config;
@@ -80,6 +90,13 @@ public final class VgiScan implements Scan, Batch, SupportsReportStatistics {
     // catalog_table_column_statistics_get round trip per call for no benefit,
     // since nothing about this immutable Scan's answer can change between calls.
     private volatile Statistics cachedStatistics;
+    private volatile PlannedInput cachedInput;
+
+    private record PlannedInput(InputPartition[] partitions, Expression[] groupingKeys) {}
+
+    private record BranchPlan(List<InputPartition> partitions, Expression[] groupingKeys) {}
+
+    record DecodedGrouping(Expression[] expressions, DataType[] keyTypes) {}
 
     /**
      * @param client the pooled connection to this catalog's VGI worker
@@ -276,6 +293,29 @@ public final class VgiScan implements Scan, Batch, SupportsReportStatistics {
 
     @Override
     public InputPartition[] planInputPartitions() {
+        return plannedInput().partitions().clone();
+    }
+
+    @Override
+    public Partitioning outputPartitioning() {
+        PlannedInput planned = plannedInput();
+        if (planned.groupingKeys() == null) {
+            return new UnknownPartitioning(planned.partitions().length);
+        }
+        return new KeyGroupedPartitioning(
+                planned.groupingKeys().clone(), planned.partitions().length);
+    }
+
+    private PlannedInput plannedInput() {
+        PlannedInput existing = cachedInput;
+        if (existing != null) return existing;
+        synchronized (this) {
+            if (cachedInput == null) cachedInput = planAllInput();
+            return cachedInput;
+        }
+    }
+
+    private PlannedInput planAllInput() {
         // Multi-branch: each branch is bound and planned independently, and
         // every branch's partitions simply concatenate into one array — this
         // falls out for free because a VgiInputPartition already carries its
@@ -283,10 +323,25 @@ public final class VgiScan implements Scan, Batch, SupportsReportStatistics {
         // downstream (VgiPartitionReaderFactory/VgiPartitionReader) needs to
         // know which branch a partition came from.
         List<InputPartition> partitions = new ArrayList<>();
+        Expression[] groupingKeys = null;
+        boolean groupingCompatible = true;
         for (VgiBranch branch : table.branches()) {
             switch (branch) {
-                case VgiScanBranch fn -> partitions.addAll(planBranchPartitions(fn));
-                case VgiFormatScanBranch fmt -> partitions.addAll(planFormatBranchPartitions(fmt));
+                case VgiScanBranch fn -> {
+                    BranchPlan planned = planBranchPartitions(fn);
+                    partitions.addAll(planned.partitions());
+                    if (planned.groupingKeys() == null) {
+                        groupingCompatible = false;
+                    } else if (groupingKeys == null) {
+                        groupingKeys = planned.groupingKeys();
+                    } else if (!java.util.Arrays.equals(groupingKeys, planned.groupingKeys())) {
+                        groupingCompatible = false;
+                    }
+                }
+                case VgiFormatScanBranch fmt -> {
+                    partitions.addAll(planFormatBranchPartitions(fmt));
+                    groupingCompatible = false;
+                }
                 // A single native-delegating branch never reaches VgiScan at
                 // all -- VgiCatalog.loadTable intercepts it and returns
                 // Spark's own real Table directly (see VgiNativeScanBranch's
@@ -305,7 +360,12 @@ public final class VgiScan implements Scan, Batch, SupportsReportStatistics {
                                 + "outside VgiScan instead (see VgiNativeScanBranch's own javadoc)");
             }
         }
-        return partitions.toArray(new InputPartition[0]);
+        if (!groupingCompatible) {
+            partitions.replaceAll(partition -> partition instanceof VgiKeyGroupedInputPartition keyed
+                    ? keyed.delegate() : partition);
+            groupingKeys = null;
+        }
+        return new PlannedInput(partitions.toArray(new InputPartition[0]), groupingKeys);
     }
 
     /**
@@ -323,7 +383,7 @@ public final class VgiScan implements Scan, Batch, SupportsReportStatistics {
         return partitions;
     }
 
-    private List<InputPartition> planBranchPartitions(VgiScanBranch branch) {
+    private BranchPlan planBranchPartitions(VgiScanBranch branch) {
         BindRequest bindRequest = new BindRequest(
                 branch.functionName(),
                 branch.scanFunctionArguments(),
@@ -372,7 +432,11 @@ public final class VgiScan implements Scan, Batch, SupportsReportStatistics {
         EncodedPushdownFilters encoded = translated.encoded();
         byte[] branchPushdownFilters = encoded == null ? null : encoded.pushdownFilters();
 
-        List<InputPartition> partitions = new ArrayList<>();
+        List<VgiInputPartition> partitions = new ArrayList<>();
+        List<InternalRow> partitionKeys = new ArrayList<>();
+        DecodedGrouping grouping = null;
+        byte[] groupingWire = null;
+        boolean groupingValid = true;
         byte[] cursor = null;
         int pagesFetched = 0;
         while (true) {
@@ -408,6 +472,14 @@ public final class VgiScan implements Scan, Batch, SupportsReportStatistics {
             PlanResponse response = client.withConnection(a ->
                     a.service().table_function_plan(RecordCodec.serializeToBytes(request), null));
 
+            if (pagesFetched == 1) {
+                groupingWire = response.key_grouping();
+                grouping = decodeGrouping(groupingWire, readSchema);
+                groupingValid = grouping != null;
+            } else if (!java.util.Arrays.equals(groupingWire, response.key_grouping())) {
+                groupingValid = false;
+            }
+
             boolean sawSentinel = false;
             for (byte[] blob : response.splits()) {
                 ScanSplit split = RecordCodec.deserializeFromBytes(blob, ScanSplit.class);
@@ -417,6 +489,8 @@ public final class VgiScan implements Scan, Batch, SupportsReportStatistics {
                     // next_cursors.
                     partitions.add(new VgiInputPartition(bindCall, bindOpaqueData,
                             boundOutputSchema[0], branchPushdownFilters, new byte[0], 0L, new String[0]));
+                    partitionKeys.add(null);
+                    groupingValid = false;
                     sawSentinel = true;
                     break;
                 }
@@ -424,6 +498,14 @@ public final class VgiScan implements Scan, Batch, SupportsReportStatistics {
                 partitions.add(new VgiInputPartition(bindCall, bindOpaqueData,
                         boundOutputSchema[0], branchPushdownFilters, split.token(),
                         estimatedBytes, resolveAddresses(response, split)));
+                try {
+                    partitionKeys.add(grouping == null
+                            ? null
+                            : PartitionKeyDecoder.decode(split.key_value(), grouping.keyTypes()));
+                } catch (IllegalArgumentException invalidKey) {
+                    partitionKeys.add(null);
+                    groupingValid = false;
+                }
             }
             if (sawSentinel) break;
 
@@ -436,7 +518,76 @@ public final class VgiScan implements Scan, Batch, SupportsReportStatistics {
             // safe to ignore rather than fan out further here.
             cursor = nextCursors.get(0);
         }
-        return partitions;
+        if (!groupingValid || grouping == null || partitions.isEmpty()
+                || partitionKeys.stream().anyMatch(java.util.Objects::isNull)) {
+            List<InputPartition> unknown = new ArrayList<>(partitions.size());
+            unknown.addAll(partitions);
+            return new BranchPlan(unknown, null);
+        }
+        List<InputPartition> keyed = new ArrayList<>(partitions.size());
+        for (int i = 0; i < partitions.size(); i++) {
+            keyed.add(new VgiKeyGroupedInputPartition(partitions.get(i), partitionKeys.get(i)));
+        }
+        return new BranchPlan(keyed, grouping.expressions());
+    }
+
+    static DecodedGrouping decodeGrouping(byte[] bytes, StructType outputSchema) {
+        if (bytes == null || bytes.length == 0) return null;
+        try {
+            KeyGrouping grouping = RecordCodec.deserializeFromBytes(bytes, KeyGrouping.class);
+            if (grouping.keys() == null || grouping.keys().isEmpty()) return null;
+            Expression[] keys = new Expression[grouping.keys().size()];
+            DataType[] keyTypes = new DataType[grouping.keys().size()];
+            for (int i = 0; i < grouping.keys().size(); i++) {
+                TransformSpec transform = RecordCodec.deserializeFromBytes(
+                        grouping.keys().get(i), TransformSpec.class);
+                // Initial portable profile: identity only. Other transforms
+                // stay unknown until their registry semantics and test vectors
+                // are implemented byte-for-byte in this adapter.
+                if (!"vgi.identity/1".equals(transform.id())
+                        || transform.parameters() != null
+                        || transform.inputs() == null
+                        || transform.inputs().size() != 1) {
+                    return null;
+                }
+                FieldPath path = RecordCodec.deserializeFromBytes(
+                        transform.inputs().get(0), FieldPath.class);
+                if (path.components() == null || path.components().isEmpty()
+                        || path.components().stream().anyMatch(String::isEmpty)) {
+                    return null;
+                }
+                DataType keyType = resolvePath(outputSchema, path.components());
+                if (keyType == null) return null;
+                keys[i] = Expressions.identity(quotedReference(path.components()));
+                keyTypes[i] = keyType;
+            }
+            return new DecodedGrouping(keys, keyTypes);
+        } catch (RuntimeException invalidMetadata) {
+            return null;
+        }
+    }
+
+    private static DataType resolvePath(StructType schema, List<String> components) {
+        DataType current = schema;
+        for (String component : components) {
+            if (!(current instanceof StructType struct)) return null;
+            org.apache.spark.sql.types.StructField match = null;
+            for (org.apache.spark.sql.types.StructField field : struct.fields()) {
+                if (field.name().equals(component)) {
+                    if (match != null) return null;
+                    match = field;
+                }
+            }
+            if (match == null) return null;
+            current = match.dataType();
+        }
+        return current;
+    }
+
+    private static String quotedReference(List<String> components) {
+        return components.stream()
+                .map(component -> "`" + component.replace("`", "``") + "`")
+                .collect(java.util.stream.Collectors.joining("."));
     }
 
     private List<String> projectedLogicalNames() {

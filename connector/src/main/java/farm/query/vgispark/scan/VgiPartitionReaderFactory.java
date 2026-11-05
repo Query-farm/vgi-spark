@@ -64,7 +64,9 @@ public final class VgiPartitionReaderFactory implements PartitionReaderFactory {
         if (partition instanceof VgiFormatInputPartition formatPartition) {
             return new VgiCsvPartitionReader(formatPartition, tableOutputSchemaBytes, projectionIds);
         }
-        VgiInputPartition vgiPartition = (VgiInputPartition) partition;
+        VgiInputPartition vgiPartition = partition instanceof VgiKeyGroupedInputPartition keyed
+                ? keyed.delegate()
+                : (VgiInputPartition) partition;
         return new VgiPartitionReader(config, vgiPartition, vgiPartition.outputSchema(),
                 projectionIds, vgiPartition.pushdownFilters(), rowLimit);
     }
