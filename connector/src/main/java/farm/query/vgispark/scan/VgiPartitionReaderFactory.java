@@ -27,7 +27,6 @@ public final class VgiPartitionReaderFactory implements PartitionReaderFactory {
     private final VgiCatalogConfig config;
     private final byte[] tableOutputSchemaBytes;
     private final List<Integer> projectionIds;
-    private final byte[] pushdownFiltersBytes;
     private final Long rowLimit;
 
     /**
@@ -35,19 +34,14 @@ public final class VgiPartitionReaderFactory implements PartitionReaderFactory {
      * @param tableOutputSchemaBytes the table's full (bind-time) Arrow schema, IPC-encoded
      * @param projectionIds the columns to project, as ordinals into the full
      *        schema, or {@code null} for all of them
-     * @param pushdownFiltersBytes the encoded {@code InitRequest.pushdown_filters}
-     *        batch, or {@code null} if nothing was pushed — the same bytes
-     *        every split's {@code init()} receives, informational/best-effort
-     *        only (see {@code VgiScanBuilder}'s own javadoc)
      * @param rowLimit a fetch-limit hint pushed to every split's {@code init()},
      *        or {@code null}
      */
     public VgiPartitionReaderFactory(VgiCatalogConfig config, byte[] tableOutputSchemaBytes,
-            List<Integer> projectionIds, byte[] pushdownFiltersBytes, Long rowLimit) {
+            List<Integer> projectionIds, Long rowLimit) {
         this.config = config;
         this.tableOutputSchemaBytes = tableOutputSchemaBytes;
         this.projectionIds = projectionIds;
-        this.pushdownFiltersBytes = pushdownFiltersBytes;
         this.rowLimit = rowLimit;
     }
 
@@ -70,7 +64,8 @@ public final class VgiPartitionReaderFactory implements PartitionReaderFactory {
         if (partition instanceof VgiFormatInputPartition formatPartition) {
             return new VgiCsvPartitionReader(formatPartition, tableOutputSchemaBytes, projectionIds);
         }
-        return new VgiPartitionReader(config, (VgiInputPartition) partition, tableOutputSchemaBytes,
-                projectionIds, pushdownFiltersBytes, rowLimit);
+        VgiInputPartition vgiPartition = (VgiInputPartition) partition;
+        return new VgiPartitionReader(config, vgiPartition, vgiPartition.outputSchema(),
+                projectionIds, vgiPartition.pushdownFilters(), rowLimit);
     }
 }

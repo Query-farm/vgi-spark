@@ -70,7 +70,7 @@ final class VgiUnboundScalarFunction implements UnboundFunction {
 
     private final VgiWorkerClient client;
     private final VgiCatalogConfig config;
-    private final String schemaName;
+    private final List<String> schemaPath;
     private final FunctionInfo info;
     private final Schema argsSchema;
     private final DataType[] inputTypes;
@@ -79,12 +79,12 @@ final class VgiUnboundScalarFunction implements UnboundFunction {
     private final boolean hasVarargs; // true iff the LAST declared argument is vgi_varargs
     private final boolean deterministic;
 
-    private VgiUnboundScalarFunction(VgiWorkerClient client, VgiCatalogConfig config, String schemaName,
+    private VgiUnboundScalarFunction(VgiWorkerClient client, VgiCatalogConfig config, List<String> schemaPath,
             FunctionInfo info, Schema argsSchema, DataType[] inputTypes, boolean[] anyArgs,
             boolean[] constArgs, boolean hasVarargs, boolean deterministic) {
         this.client = client;
         this.config = config;
-        this.schemaName = schemaName;
+        this.schemaPath = List.copyOf(schemaPath);
         this.info = info;
         this.argsSchema = argsSchema;
         this.inputTypes = inputTypes;
@@ -106,7 +106,7 @@ final class VgiUnboundScalarFunction implements UnboundFunction {
 
     @Override
     public BoundFunction bind(StructType inputSchema) {
-        String context = schemaName + "." + info.name();
+        String context = String.join(".", schemaPath) + "." + info.name();
         int declaredCount = inputTypes.length;
         int callArity = inputSchema.length();
         if (hasVarargs) {
@@ -215,7 +215,7 @@ final class VgiUnboundScalarFunction implements UnboundFunction {
             byte[] emptyArguments = ArgumentsEncoder.builder().encode();
             BindRequest bindRequest = new BindRequest(
                     info.name(), emptyArguments, "SCALAR", rowInputSchemaBytes, currentSettingsBytes(client),
-                    null, null, null, false, null, null, null, null, schemaName);
+                    null, null, null, false, null, null, null, null, schemaPath);
             byte[][] attachHandleUsed = new byte[1][];
             BindResponse[] boundHolder = new BindResponse[1];
             byte[] opaqueData = client.withConnection(a -> {
@@ -244,7 +244,7 @@ final class VgiUnboundScalarFunction implements UnboundFunction {
         // Spark already scopes one VgiScalarFunction instance to one call
         // site, unlike Trino's shared-across-Drivers cache).
         DataType returnType = resolveStaticReturnType(context);
-        return VgiScalarFunction.lazyConst(config, schemaName, info.name(), resolvedInputTypes, resolvedFieldsArray,
+        return VgiScalarFunction.lazyConst(config, schemaPath, info.name(), resolvedInputTypes, resolvedFieldsArray,
                 rowArgIndices, constArgIndices, rowInputSchemaBytes, returnType, deterministic, shortCircuitOnNull);
     }
 
@@ -277,7 +277,7 @@ final class VgiUnboundScalarFunction implements UnboundFunction {
      * {@link #tryBuild} time.
      */
     private DataType resolveReturnType(byte[] outputSchemaBytes) {
-        String context = schemaName + "." + info.name();
+        String context = String.join(".", schemaPath) + "." + info.name();
         Schema outSchema = ArrowSchemaCodec.deserializeSchema(outputSchemaBytes);
         if (outSchema == null || outSchema.getFields().size() != 1) {
             throw new UnsupportedOperationException(context + ": expected exactly one output column from bind(), "
@@ -430,7 +430,7 @@ final class VgiUnboundScalarFunction implements UnboundFunction {
                 request.input_schema(), request.settings(), request.secrets(),
                 attachHandle, request.transaction_opaque_data(), request.resolved_secrets_provided(),
                 request.at_unit(), request.at_value(), request.copy_from(), request.copy_to(),
-                request.schema_name());
+                request.schema_path(), request.argument_names());
     }
 
     /**
@@ -453,8 +453,8 @@ final class VgiUnboundScalarFunction implements UnboundFunction {
      * VgiScalarFunction}'s own javadoc.
      */
     static VgiUnboundScalarFunction tryBuild(
-            VgiWorkerClient client, VgiCatalogConfig config, String schemaName, FunctionInfo info) {
-        String context = schemaName + "." + info.name();
+            VgiWorkerClient client, VgiCatalogConfig config, List<String> schemaPath, FunctionInfo info) {
+        String context = String.join(".", schemaPath) + "." + info.name();
         Schema argsSchema = ArrowSchemaCodec.deserializeSchema(info.arguments());
         List<Field> argFields = argsSchema == null ? List.of() : argsSchema.getFields();
         DataType[] inputTypes = new DataType[argFields.size()];
@@ -537,7 +537,7 @@ final class VgiUnboundScalarFunction implements UnboundFunction {
         boolean deterministic = info.stability() == null || "CONSISTENT".equals(info.stability());
 
         return new VgiUnboundScalarFunction(
-                client, config, schemaName, info, argsSchema == null ? new Schema(List.of()) : argsSchema,
+                client, config, schemaPath, info, argsSchema == null ? new Schema(List.of()) : argsSchema,
                 inputTypes, anyArgs, constArgs, hasVarargs, deterministic);
     }
 }

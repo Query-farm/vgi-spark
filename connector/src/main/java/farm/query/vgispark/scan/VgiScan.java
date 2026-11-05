@@ -3,6 +3,7 @@
 package farm.query.vgispark.scan;
 
 import farm.query.vgi.client.ColumnStatisticsDecoder;
+import farm.query.vgi.client.EncodedPushdownFilters;
 import farm.query.vgi.protocol.BindRequest;
 import farm.query.vgi.protocol.BindResponse;
 import farm.query.vgi.protocol.PlanResponse;
@@ -16,10 +17,15 @@ import farm.query.vgispark.branch.VgiFormatScanBranch;
 import farm.query.vgispark.branch.VgiNativeScanBranch;
 import farm.query.vgispark.branch.VgiScanBranch;
 import farm.query.vgispark.client.VgiWorkerClient;
+import farm.query.vgispark.filter.VgiFilterTranslator;
+import farm.query.vgispark.types.ArrowSchemaCodec;
 import org.apache.arrow.vector.types.pojo.ArrowType;
+import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.spark.sql.connector.catalog.Column;
 import org.apache.spark.sql.connector.expressions.Expressions;
 import org.apache.spark.sql.connector.expressions.NamedReference;
+import org.apache.spark.sql.connector.expressions.filter.Predicate;
 import org.apache.spark.sql.connector.read.Batch;
 import org.apache.spark.sql.connector.read.InputPartition;
 import org.apache.spark.sql.connector.read.PartitionReaderFactory;
@@ -64,7 +70,7 @@ public final class VgiScan implements Scan, Batch, SupportsReportStatistics {
     private final VgiCatalogConfig config;
     private final VgiTable table;
     private final List<Integer> projectionIds;
-    private final byte[] pushdownFiltersBytes;
+    private final Predicate[] rawPredicates;
     private final Long rowLimit;
     private final StructType readSchema;
 
@@ -82,18 +88,18 @@ public final class VgiScan implements Scan, Batch, SupportsReportStatistics {
      * @param projectionIds the columns to project, as ordinals into the
      *        table's full Arrow schema, in ascending order, or {@code null}
      *        for all of them
-     * @param pushdownFiltersBytes the encoded {@code InitRequest.pushdown_filters}/
-     *        {@code TableFunctionPlanRequest.pushdown_filters} batch, or
-     *        {@code null} if nothing was pushed
+     * @param rawPredicates predicates eligible for protocol 3 pushdown. They
+     *        are encoded after bind, against each branch's authoritative
+     *        output schema.
      * @param rowLimit a fetch-limit hint pushed to every split, or {@code null}
      */
     public VgiScan(VgiWorkerClient client, VgiCatalogConfig config, VgiTable table,
-            List<Integer> projectionIds, byte[] pushdownFiltersBytes, Long rowLimit) {
+            List<Integer> projectionIds, Predicate[] rawPredicates, Long rowLimit) {
         this.client = client;
         this.config = config;
         this.table = table;
         this.projectionIds = projectionIds;
-        this.pushdownFiltersBytes = pushdownFiltersBytes;
+        this.rawPredicates = rawPredicates;
         this.rowLimit = rowLimit;
         // Built from table.columns() + projectionIds directly, in ordinal
         // order — NOT from prunedSchema's own (Spark-chosen, not necessarily
@@ -188,7 +194,7 @@ public final class VgiScan implements Scan, Batch, SupportsReportStatistics {
         byte[] raw;
         try {
             raw = client.withConnection(a -> a.service().catalog_table_column_statistics_get(
-                    a.handle(), table.schemaName(), table.tableName(), null, null));
+                    a.handle(), table.schemaPath(), table.tableName(), null, null));
         } catch (RuntimeException e) {
             return Map.of();
         }
@@ -357,6 +363,14 @@ public final class VgiScan implements Scan, Batch, SupportsReportStatistics {
             return bound.opaque_data();
         });
         byte[] bindCall = RecordCodec.serializeToBytes(withAttachHandle(bindRequest, attachHandleUsed[0]));
+        Schema authoritativeSchema = ArrowSchemaCodec.deserializeSchema(boundOutputSchema[0]);
+        List<Field> logicalFields = table.outputSchema().getFields();
+        List<Field> authoritativeFields = authoritativeSchema == null
+                ? List.of() : authoritativeSchema.getFields();
+        VgiFilterTranslator.Result translated = VgiFilterTranslator.translate(
+                rawPredicates, logicalFields, authoritativeFields, projectedLogicalNames());
+        EncodedPushdownFilters encoded = translated.encoded();
+        byte[] branchPushdownFilters = encoded == null ? null : encoded.pushdownFilters();
 
         List<InputPartition> partitions = new ArrayList<>();
         byte[] cursor = null;
@@ -378,7 +392,7 @@ public final class VgiScan implements Scan, Batch, SupportsReportStatistics {
             TableFunctionPlanRequest request = new TableFunctionPlanRequest(
                     bindCall, bindOpaqueData,
                     projectionIds,
-                    pushdownFiltersBytes,
+                    branchPushdownFilters,
                     null,           // join_keys
                     rowLimit,
                     config.targetSplitBytes(),
@@ -401,12 +415,14 @@ public final class VgiScan implements Scan, Batch, SupportsReportStatistics {
                     // The not-split-capable sentinel: exactly one such split,
                     // standing for the whole scan. Stop here regardless of
                     // next_cursors.
-                    partitions.add(new VgiInputPartition(bindCall, bindOpaqueData, new byte[0], 0L, new String[0]));
+                    partitions.add(new VgiInputPartition(bindCall, bindOpaqueData,
+                            boundOutputSchema[0], branchPushdownFilters, new byte[0], 0L, new String[0]));
                     sawSentinel = true;
                     break;
                 }
                 long estimatedBytes = split.estimated_bytes() == null ? 0L : split.estimated_bytes();
-                partitions.add(new VgiInputPartition(bindCall, bindOpaqueData, split.token(),
+                partitions.add(new VgiInputPartition(bindCall, bindOpaqueData,
+                        boundOutputSchema[0], branchPushdownFilters, split.token(),
                         estimatedBytes, resolveAddresses(response, split)));
             }
             if (sawSentinel) break;
@@ -420,42 +436,19 @@ public final class VgiScan implements Scan, Batch, SupportsReportStatistics {
             // safe to ignore rather than fan out further here.
             cursor = nextCursors.get(0);
         }
-        // Last-branch-wins: fine for the overwhelmingly common single-function-
-        // branch case (multi-branch scans where different branches' backing
-        // functions disagree on column NAMING are not a scenario this
-        // connector's own multi-branch support has ever exercised — see
-        // #createReaderFactory's own note on why this is safe here).
-        boundOutputSchemaBytes = boundOutputSchema[0];
         return partitions;
     }
 
-    // Set by planBranchPartitions — the scan FUNCTION's own bind-resolved
-    // output schema, as opposed to table.outputSchemaBytes() (the
-    // DECLARATIVE table's own advertised column names). A declarative table
-    // can legitimately rename its backing function's raw columns (e.g. the
-    // reference fixture's data.numbers table declares column "value" over
-    // main.sequence's own raw "n") — Spark never notices, since a
-    // ColumnarBatch's Arrow vectors are matched to VgiScan#readSchema
-    // PURELY BY POSITION (see readSchema's own comment), never by name. But
-    // the WIRE protocol (InitRequest.output_schema, which the worker uses to
-    // narrow/project each raw batch BY NAME before sending it — see
-    // vgi-rust's own project_batch) and this class's OWN local
-    // VectorSchemaRoot.getVector(name) lookup in VgiPartitionReader#next
-    // both need the RAW function-level names to actually find anything —
-    // using the declared ("value") name for either was a real bug (a bind
-    // that resolves fine still fails downstream with "projection column
-    // 'value' not found in input" the moment a real batch comes back
-    // carrying "n"). null only when planInputPartitions() never ran a
-    // function branch at all (pure FORMAT-branch scans) — falls back to the
-    // table's own declared schema, which for that case is never sent over
-    // the wire this way to begin with.
-    private volatile byte[] boundOutputSchemaBytes;
+    private List<String> projectedLogicalNames() {
+        List<Field> fields = table.outputSchema().getFields();
+        if (projectionIds == null) return fields.stream().map(Field::getName).toList();
+        return projectionIds.stream().map(i -> fields.get(i).getName()).toList();
+    }
 
     @Override
     public PartitionReaderFactory createReaderFactory() {
-        byte[] wireSchema = boundOutputSchemaBytes != null ? boundOutputSchemaBytes : table.outputSchemaBytes();
         return new VgiPartitionReaderFactory(
-                config, wireSchema, projectionIds, pushdownFiltersBytes, rowLimit);
+                config, table.outputSchemaBytes(), projectionIds, rowLimit);
     }
 
     private static BindRequest withAttachHandle(BindRequest request, byte[] attachHandle) {
@@ -464,7 +457,7 @@ public final class VgiScan implements Scan, Batch, SupportsReportStatistics {
                 request.input_schema(), request.settings(), request.secrets(),
                 attachHandle, request.transaction_opaque_data(), request.resolved_secrets_provided(),
                 request.at_unit(), request.at_value(), request.copy_from(), request.copy_to(),
-                request.schema_name());
+                request.schema_path(), request.argument_names());
     }
 
     private static String[] resolveAddresses(PlanResponse response, ScanSplit split) {

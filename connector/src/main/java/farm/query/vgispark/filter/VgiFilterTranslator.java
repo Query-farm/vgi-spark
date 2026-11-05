@@ -4,7 +4,6 @@ package farm.query.vgispark.filter;
 
 import farm.query.vgi.client.FilterPredicate;
 import farm.query.vgi.client.ProjectedColumn;
-import farm.query.vgi.client.ProjectedColumns;
 import farm.query.vgi.client.PushdownFiltersEncoder;
 import farm.query.vgi.client.EncodedPushdownFilters;
 import farm.query.vgi.client.ScalarValue;
@@ -42,7 +41,7 @@ import java.util.Set;
  * <p>VGI's filter wire form is <em>column-rooted</em>: a single {@link
  * FilterPredicate} tree — including every node under an {@code AND}/{@code OR}
  * — applies to exactly one column (see {@code TableInfo.required_filters}'s
- * "dotted column path" framing and {@code FilterPredicate}'s own javadoc).
+ * component-path framing and {@code FilterPredicate}'s own javadoc).
  * Multiple columns compose only by sending several top-level {@code
  * (column, predicate)} pairs to one {@link PushdownFiltersEncoder}, implicitly
  * ANDed by the worker. A Spark predicate whose descendants reference more
@@ -86,26 +85,35 @@ public final class VgiFilterTranslator {
      * Translate as many of {@code predicates} as this class can express, and
      * report the column names actually covered (for {@code
      * TableInfo.required_filters} enforcement — see {@code VgiScanBuilder}).
-     * A covered name is the FULL dotted path (e.g. {@code "s.a"}), matching
-     * the dotted-path strings {@code TableInfo.required_filters} itself uses.
+     * A covered name is the full component path (e.g. {@code ["s", "a"]}),
+     * matching protocol 3's component-preserving {@code required_filters}.
      *
      * @param predicates the predicates Spark offered (one array element per
      *        top-level conjunct)
      * @param fullSchema the table's full (unprojected) Arrow schema — column
      *        names are matched against this to resolve each predicate's
      *        target field and Arrow type
-     * @param projectedColumnNames the columns this scan actually projects, in
-     *        projection order — {@code column_index} on the wire is relative
-     *        to THIS list, not the base schema (see {@link ProjectedColumn})
+     * @param authoritativeSchema the scan function's complete bind output
+     *        schema. Protocol 3 validates reference indices and names against
+     *        this schema, which may rename declarative table columns.
+     * @param projectedColumnNames the logical table columns this scan actually projects.
+     *        This controls eligibility only: protocol 3's authoritative
+     *        {@code column_index} remains relative to {@code authoritativeSchema}, not
+     *        the pruned projection (see {@link ProjectedColumn}).
      * @return the encoded filter batch (or {@code null} if nothing translated,
      *         see {@link Result#isEmpty()}), plus the set of column names covered
      */
-    public static Result translate(Predicate[] predicates, List<Field> fullSchema, List<String> projectedColumnNames) {
+    public static Result translate(Predicate[] predicates, List<Field> fullSchema,
+            List<Field> authoritativeSchema, List<String> projectedColumnNames) {
         java.util.Map<String, Field> fieldByName = new java.util.LinkedHashMap<>();
-        for (Field f : fullSchema) fieldByName.put(f.getName(), f);
-
-        ProjectedColumns projected = ProjectedColumns.of(projectedColumnNames);
-        Set<String> covered = new LinkedHashSet<>();
+        java.util.Map<String, Integer> ordinalByName = new java.util.LinkedHashMap<>();
+        for (int i = 0; i < fullSchema.size(); i++) {
+            Field f = fullSchema.get(i);
+            fieldByName.put(f.getName(), f);
+            ordinalByName.put(f.getName(), i);
+        }
+        Set<String> projected = Set.copyOf(projectedColumnNames);
+        Set<List<String>> covered = new LinkedHashSet<>();
         List<Predicate> pushed = new java.util.ArrayList<>();
         // Grouped by TOP-level column, not emitted per Spark predicate: DuckDB's
         // own TableFilterSet holds at most one (possibly AND-combined) filter
@@ -121,23 +129,25 @@ public final class VgiFilterTranslator {
         java.util.Map<String, List<FilterPredicate>> translatedByTopName = new java.util.LinkedHashMap<>();
 
         for (Predicate p : predicates == null ? new Predicate[0] : predicates) {
-            Set<String> columns = new LinkedHashSet<>();
+            Set<List<String>> columns = new LinkedHashSet<>();
             collectColumns(p, columns);
             if (columns.size() != 1) {
                 continue; // zero or multiple distinct columns — not expressible as one column-rooted tree
             }
-            String columnName = columns.iterator().next();
-            String[] path = columnName.split("\\.");
-            String topName = path[0];
+            List<String> path = columns.iterator().next();
+            String topName = path.get(0);
             Field topField = fieldByName.get(topName);
             if (topField == null) continue;
+            Integer topOrdinal = ordinalByName.get(topName);
+            if (topOrdinal == null || topOrdinal >= authoritativeSchema.size()) continue;
+            Field authoritativeTopField = authoritativeSchema.get(topOrdinal);
 
             FilterPredicate translated;
-            if (path.length == 1) {
+            if (path.size() == 1) {
                 translated = translateNode(p, topField.getType());
             } else {
-                List<StructStep> steps = new java.util.ArrayList<>(path.length - 1);
-                ArrowType leafType = resolveStructPath(topField, path, steps);
+                List<StructStep> steps = new java.util.ArrayList<>(path.size() - 1);
+                ArrowType leafType = resolveStructPath(topField, authoritativeTopField, path, steps);
                 if (leafType == null) continue; // a segment wasn't found, or a non-struct was navigated into
                 FilterPredicate leaf = translateNode(p, leafType);
                 if (leaf == null) continue;
@@ -149,16 +159,15 @@ public final class VgiFilterTranslator {
             }
             if (translated == null) continue;
 
-            ProjectedColumn projectedColumn;
-            try {
-                projectedColumn = projected.column(topName);
-            } catch (IllegalArgumentException notProjected) {
+            if (!projected.contains(topName)) {
                 continue; // filtering on a column this scan doesn't even project — nothing to root it to
             }
+            ProjectedColumn projectedColumn = ProjectedColumn.of(
+                    authoritativeTopField.getName(), topOrdinal);
 
             columnByTopName.put(topName, projectedColumn);
             translatedByTopName.computeIfAbsent(topName, k -> new java.util.ArrayList<>()).add(translated);
-            covered.add(columnName);
+            covered.add(path);
             pushed.add(p);
         }
 
@@ -184,23 +193,29 @@ public final class VgiFilterTranslator {
      * @return the leaf field's Arrow type, or {@code null} if any segment
      *         isn't found (including navigating into a non-struct field)
      */
-    private static ArrowType resolveStructPath(Field topField, String[] path, List<StructStep> stepsOut) {
+    private static ArrowType resolveStructPath(Field topField, Field authoritativeTopField,
+            List<String> path, List<StructStep> stepsOut) {
         Field current = topField;
+        Field authoritativeCurrent = authoritativeTopField;
         ArrowType leafType = null;
-        for (int i = 1; i < path.length; i++) {
+        for (int i = 1; i < path.size(); i++) {
             List<Field> children = current.getChildren();
             Field found = null;
             int foundIndex = -1;
             for (int j = 0; j < children.size(); j++) {
-                if (children.get(j).getName().equals(path[i])) {
+                if (children.get(j).getName().equals(path.get(i))) {
                     found = children.get(j);
                     foundIndex = j;
                     break;
                 }
             }
             if (found == null) return null;
-            stepsOut.add(new StructStep(foundIndex, path[i]));
+            List<Field> authoritativeChildren = authoritativeCurrent.getChildren();
+            if (foundIndex >= authoritativeChildren.size()) return null;
+            Field authoritativeFound = authoritativeChildren.get(foundIndex);
+            stepsOut.add(new StructStep(foundIndex, authoritativeFound.getName()));
             current = found;
+            authoritativeCurrent = authoritativeFound;
             leafType = current.getType();
         }
         return leafType;
@@ -216,15 +231,16 @@ public final class VgiFilterTranslator {
      *        array from {@code pushPredicates}, since none of this is
      *        authoritative — see the class javadoc
      */
-    public record Result(EncodedPushdownFilters encoded, Set<String> coveredColumns, Predicate[] pushedPredicates) {
+    public record Result(EncodedPushdownFilters encoded, Set<List<String>> coveredColumns,
+            Predicate[] pushedPredicates) {
         public boolean isEmpty() {
             return encoded == null;
         }
     }
 
-    private static void collectColumns(Expression expr, Set<String> out) {
+    private static void collectColumns(Expression expr, Set<List<String>> out) {
         if (expr instanceof NamedReference ref) {
-            out.add(String.join(".", ref.fieldNames()));
+            out.add(List.of(ref.fieldNames()));
             return;
         }
         for (Expression child : expr.children()) {
@@ -298,7 +314,7 @@ public final class VgiFilterTranslator {
             case GE -> ComparisonOperator.LE;
             case LT -> ComparisonOperator.GT;
             case LE -> ComparisonOperator.GE;
-            case EQ, NE -> op; // symmetric
+            case EQ, NE, DISTINCT_FROM, NOT_DISTINCT_FROM -> op; // symmetric
         };
     }
 

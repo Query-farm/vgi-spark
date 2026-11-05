@@ -30,6 +30,7 @@ import org.apache.spark.sql.types.DataType;
 import org.apache.spark.util.TaskCompletionListener;
 
 import java.util.Arrays;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -86,7 +87,7 @@ import java.util.Map;
 final class VgiScalarFunction implements ScalarFunction<Object> {
 
     private final VgiCatalogConfig config;
-    private final String schemaName;      // only used by the lazy-const bind path
+    private final List<String> schemaPath; // only used by the lazy-const bind path
     private final String functionName;
     private final byte[] driverBindCallBytes;     // non-null only in eager mode
     private final byte[] driverOutputSchemaBytes; // non-null only in eager mode
@@ -111,12 +112,12 @@ final class VgiScalarFunction implements ScalarFunction<Object> {
     private transient byte[] cachedOpaqueData;
     private transient Object[] cachedConstValues;
 
-    private VgiScalarFunction(VgiCatalogConfig config, String schemaName, String functionName,
+    private VgiScalarFunction(VgiCatalogConfig config, List<String> schemaPath, String functionName,
             byte[] driverBindCallBytes, byte[] driverOutputSchemaBytes, byte[] driverOpaqueData,
             byte[] rowInputSchemaBytes, DataType[] inputTypes, int[] rowArgIndices, int[] constArgIndices,
             Field[] resolvedFields, DataType returnType, boolean deterministic, boolean shortCircuitOnNull) {
         this.config = config;
-        this.schemaName = schemaName;
+        this.schemaPath = schemaPath == null ? null : List.copyOf(schemaPath);
         this.functionName = functionName;
         this.driverBindCallBytes = driverBindCallBytes;
         this.driverOutputSchemaBytes = driverOutputSchemaBytes;
@@ -141,10 +142,10 @@ final class VgiScalarFunction implements ScalarFunction<Object> {
     }
 
     /** At least one {@code vgi_const} argument — bound lazily, per observed value, in {@link #produceResult}. */
-    static VgiScalarFunction lazyConst(VgiCatalogConfig config, String schemaName, String functionName,
+    static VgiScalarFunction lazyConst(VgiCatalogConfig config, List<String> schemaPath, String functionName,
             DataType[] inputTypes, Field[] resolvedFields, int[] rowArgIndices, int[] constArgIndices,
             byte[] rowInputSchemaBytes, DataType returnType, boolean deterministic, boolean shortCircuitOnNull) {
-        return new VgiScalarFunction(config, schemaName, functionName, null, null, null,
+        return new VgiScalarFunction(config, schemaPath, functionName, null, null, null,
                 rowInputSchemaBytes, inputTypes, rowArgIndices, constArgIndices, resolvedFields, returnType,
                 deterministic, shortCircuitOnNull);
     }
@@ -287,7 +288,7 @@ final class VgiScalarFunction implements ScalarFunction<Object> {
                 false,                // resolved_secrets_provided
                 null, null,           // at_unit / at_value — not applicable to scalars
                 null, null,           // copy_from / copy_to
-                schemaName);
+                schemaPath);
         BindResponse bound = connection.service().bind(bindRequest, null);
         cachedBindCallBytes = RecordCodec.serializeToBytes(bindRequest);
         cachedOutputSchemaBytes = bound.output_schema();

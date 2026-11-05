@@ -82,7 +82,7 @@ public final class VgiUnboundTableProcedure implements SimpleProcedure {
 
     private final VgiWorkerClient client;
     private final VgiCatalogConfig config;
-    private final String schemaName;
+    private final List<String> schemaPath;
     private final FunctionInfo info;
     private final List<Field> argFields;
     // Parallel to argFields — the Spark type each argument reads as from the
@@ -94,12 +94,12 @@ public final class VgiUnboundTableProcedure implements SimpleProcedure {
     private final ProcedureParameter[] parameters;
     private final boolean deterministic;
 
-    private VgiUnboundTableProcedure(VgiWorkerClient client, VgiCatalogConfig config, String schemaName,
+    private VgiUnboundTableProcedure(VgiWorkerClient client, VgiCatalogConfig config, List<String> schemaPath,
             FunctionInfo info, List<Field> argFields, DataType[] paramTypes, ProcedureParameter[] parameters,
             boolean deterministic) {
         this.client = client;
         this.config = config;
-        this.schemaName = schemaName;
+        this.schemaPath = List.copyOf(schemaPath);
         this.info = info;
         this.argFields = argFields;
         this.paramTypes = paramTypes;
@@ -137,7 +137,7 @@ public final class VgiUnboundTableProcedure implements SimpleProcedure {
         if (args.numFields() != argFields.size()) {
             // Defensive — Spark's own analyzer should already have enforced arity
             // via parameters() before ever reaching call().
-            throw new IllegalStateException(schemaName + "." + info.name() + ": expected "
+            throw new IllegalStateException(String.join(".", schemaPath) + "." + info.name() + ": expected "
                     + argFields.size() + " argument(s), call() received " + args.numFields());
         }
         ArgumentsEncoder encoder = ArgumentsEncoder.builder();
@@ -196,11 +196,11 @@ public final class VgiUnboundTableProcedure implements SimpleProcedure {
                 // resolved schema are the same lookup — no ambiguity to
                 // preserve by omitting it, and VGI protocol 1.1.0 requires a
                 // bind to name its owning schema.
-                schemaName);
+                schemaPath);
         BindResponse bound = client.withConnection(a -> a.service().bind(
                 withAttachHandle(bindRequest, a.handle()), null));
 
-        VgiTable syntheticTable = new VgiTable(schemaName, info.name(),
+        VgiTable syntheticTable = new VgiTable(schemaPath, info.name(),
                 List.of(new VgiScanBranch(info.name(), encodedArgs)),
                 bound.output_schema(), null, null, null, List.of(),
                 client, config);
@@ -265,7 +265,7 @@ public final class VgiUnboundTableProcedure implements SimpleProcedure {
                 request.input_schema(), request.settings(), request.secrets(),
                 attachHandle, request.transaction_opaque_data(), request.resolved_secrets_provided(),
                 request.at_unit(), request.at_value(), request.copy_from(), request.copy_to(),
-                request.schema_name());
+                request.schema_path(), request.argument_names());
     }
 
     /**
@@ -275,8 +275,8 @@ public final class VgiUnboundTableProcedure implements SimpleProcedure {
      * refusal style.
      */
     public static VgiUnboundTableProcedure tryBuild(
-            VgiWorkerClient client, VgiCatalogConfig config, String schemaName, FunctionInfo info) {
-        String context = schemaName + "." + info.name();
+            VgiWorkerClient client, VgiCatalogConfig config, List<String> schemaPath, FunctionInfo info) {
+        String context = String.join(".", schemaPath) + "." + info.name();
         Schema argsSchema = ArrowSchemaCodec.deserializeSchema(info.arguments());
         List<Field> argFields = argsSchema == null ? List.of() : argsSchema.getFields();
         ProcedureParameter[] parameters = new ProcedureParameter[argFields.size()];
@@ -338,6 +338,6 @@ public final class VgiUnboundTableProcedure implements SimpleProcedure {
         boolean deterministic = info.stability() == null || "CONSISTENT".equals(info.stability());
 
         return new VgiUnboundTableProcedure(
-                client, config, schemaName, info, argFields, paramTypes, parameters, deterministic);
+                client, config, schemaPath, info, argFields, paramTypes, parameters, deterministic);
     }
 }

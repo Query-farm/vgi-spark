@@ -254,7 +254,7 @@ public final class VgiWorkerClient implements AutoCloseable {
     // function name reused across two schemas can only resolve to whichever
     // SAME-NAMED sibling was discovered first, never a cross-worker/
     // cross-tenant leak (both belong to this one attached worker).
-    private volatile Map<String, String> scanFunctionSchemas;
+    private volatile Map<String, FunctionInfo> scanFunctions;
 
     /**
      * @param functionName a scan function's bare name — {@code
@@ -272,25 +272,35 @@ public final class VgiWorkerClient implements AutoCloseable {
      *         dispatch rules accept a null {@code schema_name} for exactly
      *         that case, resolving it by bare name instead)
      */
-    public String scanFunctionSchema(String functionName) {
-        Map<String, String> cached = scanFunctionSchemas;
+    public List<String> scanFunctionSchema(String functionName) {
+        FunctionInfo info = scanFunctionInfo(functionName);
+        return info == null ? null : info.schema_path();
+    }
+
+    /**
+     * Return discovery metadata for a table scan function. Protocol 3 clients
+     * use this in addition to schema qualification: pushed filters may only be
+     * sent when {@link FunctionInfo#filter_pushdown()} is explicitly true.
+     */
+    public FunctionInfo scanFunctionInfo(String functionName) {
+        Map<String, FunctionInfo> cached = scanFunctions;
         if (cached == null) {
-            cached = discoverScanFunctionSchemas();
-            scanFunctionSchemas = cached;
+            cached = discoverScanFunctions();
+            scanFunctions = cached;
         }
         return cached.get(functionName.toLowerCase(Locale.ROOT));
     }
 
-    private Map<String, String> discoverScanFunctionSchemas() {
+    private Map<String, FunctionInfo> discoverScanFunctions() {
         return withConnection(a -> {
-            List<String> schemas = new ArrayList<>();
-            for (byte[] item : a.service().catalog_schemas(a.handle(), null).items()) {
-                schemas.add(RecordCodec.deserializeFromBytes(item, SchemaInfo.class).name());
+            List<List<String>> schemas = new ArrayList<>();
+            for (byte[] item : a.service().catalog_schemas(a.handle(), null, null).items()) {
+                schemas.add(RecordCodec.deserializeFromBytes(item, SchemaInfo.class).path());
             }
-            Map<String, String> byName = new LinkedHashMap<>();
-            for (String schemaName : schemas) {
+            Map<String, FunctionInfo> byName = new LinkedHashMap<>();
+            for (List<String> schemaPath : schemas) {
                 ItemsResponse functions = a.service().catalog_schema_contents_functions(
-                        a.handle(), schemaName, "TABLE_FUNCTION", null, null);
+                        a.handle(), schemaPath, "TABLE_FUNCTION", null, null);
                 for (byte[] item : functions.items()) {
                     FunctionInfo info = RecordCodec.deserializeFromBytes(item, FunctionInfo.class);
                     // Only plain producer-mode TABLE functions — a
@@ -304,7 +314,7 @@ public final class VgiWorkerClient implements AutoCloseable {
                     // .function_type carries the wire's lowercase
                     // dict-encoded enum payload verbatim.
                     if (!"table".equalsIgnoreCase(info.function_type())) continue;
-                    byName.putIfAbsent(info.name().toLowerCase(Locale.ROOT), info.schema_name());
+                    byName.putIfAbsent(info.name().toLowerCase(Locale.ROOT), info);
                 }
             }
             return Map.copyOf(byName);

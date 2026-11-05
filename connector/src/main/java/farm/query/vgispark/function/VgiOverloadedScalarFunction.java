@@ -51,14 +51,14 @@ final class VgiOverloadedScalarFunction implements UnboundFunction {
 
     private final VgiWorkerClient client;
     private final VgiCatalogConfig config;
-    private final String schemaName;
+    private final List<String> schemaPath;
     private final List<FunctionInfo> candidates;
 
     VgiOverloadedScalarFunction(
-            VgiWorkerClient client, VgiCatalogConfig config, String schemaName, List<FunctionInfo> candidates) {
+            VgiWorkerClient client, VgiCatalogConfig config, List<String> schemaPath, List<FunctionInfo> candidates) {
         this.client = client;
         this.config = config;
-        this.schemaName = schemaName;
+        this.schemaPath = List.copyOf(schemaPath);
         this.candidates = candidates;
     }
 
@@ -69,12 +69,12 @@ final class VgiOverloadedScalarFunction implements UnboundFunction {
 
     @Override
     public String description() {
-        return schemaName + "." + name() + ": " + candidates.size() + " overloads";
+        return String.join(".", schemaPath) + "." + name() + ": " + candidates.size() + " overloads";
     }
 
     @Override
     public BoundFunction bind(StructType inputSchema) {
-        String context = schemaName + "." + name();
+        String context = String.join(".", schemaPath) + "." + name();
         int callArity = inputSchema.length();
 
         List<FunctionInfo> arityMatches = candidates.stream()
@@ -123,7 +123,7 @@ final class VgiOverloadedScalarFunction implements UnboundFunction {
             }
         }
 
-        return VgiUnboundScalarFunction.tryBuild(client, config, schemaName, typeMatches.get(0)).bind(inputSchema);
+        return VgiUnboundScalarFunction.tryBuild(client, config, schemaPath, typeMatches.get(0)).bind(inputSchema);
     }
 
     private static boolean arityCompatible(FunctionInfo info, int callArity) {

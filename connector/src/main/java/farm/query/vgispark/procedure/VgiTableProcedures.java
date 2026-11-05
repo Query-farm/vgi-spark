@@ -41,10 +41,11 @@ public final class VgiTableProcedures {
      * @return the identifiers, in the worker's own order
      */
     public static Identifier[] listProcedures(VgiWorkerClient client, String[] namespace) {
-        if (namespace.length != 1) return new Identifier[0];
-        String schemaName = namespace[0];
+        if (namespace.length == 0) return new Identifier[0];
+        List<String> schemaPath = List.of(namespace);
         ItemsResponse resp = client.withConnection(a -> a.service()
-                .catalog_schema_contents_functions(a.handle(), schemaName, "TABLE_FUNCTION", null, null));
+                .catalog_schema_contents_functions(
+                        a.handle(), schemaPath, "TABLE_FUNCTION", null, null));
         List<Identifier> out = new ArrayList<>(resp.items().size());
         for (byte[] item : resp.items()) {
             FunctionInfo info = RecordCodec.deserializeFromBytes(item, FunctionInfo.class);
@@ -56,7 +57,7 @@ public final class VgiTableProcedures {
             // never going to match this response FIELD's value; the two are
             // unrelated strings that only happened to share four letters.
             if (!"table".equalsIgnoreCase(info.function_type())) continue; // table_in_out/table_buffering excluded — see class javadoc
-            out.add(Identifier.of(new String[] {schemaName}, info.name()));
+            out.add(Identifier.of(info.schema_path().toArray(String[]::new), info.name()));
         }
         return out.toArray(new Identifier[0]);
     }
@@ -83,23 +84,25 @@ public final class VgiTableProcedures {
      *         #tryBuild}'s own validation)
      */
     public static UnboundProcedure loadProcedure(VgiWorkerClient client, VgiCatalogConfig config, Identifier ident) {
-        String schemaName;
-        if (ident.namespace().length == 1) {
-            schemaName = ident.namespace()[0];
+        List<String> schemaPath;
+        if (ident.namespace().length > 0) {
+            schemaPath = List.of(ident.namespace());
         } else if (ident.namespace().length == 0 && client.defaultSchema() != null) {
-            schemaName = client.defaultSchema();
+            schemaPath = List.of(client.defaultSchema());
         } else {
             throw new IllegalArgumentException("no such procedure: " + ident);
         }
         String procName = ident.name();
         ItemsResponse resp = client.withConnection(a -> a.service()
-                .catalog_schema_contents_functions(a.handle(), schemaName, "TABLE_FUNCTION", null, null));
+                .catalog_schema_contents_functions(
+                        a.handle(), schemaPath, "TABLE_FUNCTION", null, null));
         for (byte[] item : resp.items()) {
             FunctionInfo info = RecordCodec.deserializeFromBytes(item, FunctionInfo.class);
             if (info.name().equalsIgnoreCase(procName) && "table".equalsIgnoreCase(info.function_type())) {
-                return VgiUnboundTableProcedure.tryBuild(client, config, schemaName, info);
+                return VgiUnboundTableProcedure.tryBuild(client, config, schemaPath, info);
             }
         }
-        throw new IllegalArgumentException("no such procedure: " + schemaName + "." + procName);
+        throw new IllegalArgumentException(
+                "no such procedure: " + String.join(".", schemaPath) + "." + procName);
     }
 }

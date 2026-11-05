@@ -25,6 +25,8 @@ import org.apache.spark.sql.connector.read.InputPartition;
  *
  * @param bindCall the serialised {@code BindRequest} this split's scan was bound with
  * @param bindOpaqueData the matching {@code BindResponse.opaque_data}, or {@code null}
+ * @param outputSchema the complete bind output schema for this branch
+ * @param pushdownFilters protocol 3 filters encoded against that output schema
  * @param token the split's redemption token, or empty for the not-split-capable sentinel
  * @param estimatedBytes this split's estimated size, or 0 if unknown
  * @param addresses hosts where this split is cheap to read, from
@@ -34,6 +36,8 @@ import org.apache.spark.sql.connector.read.InputPartition;
 public record VgiInputPartition(
         byte[] bindCall,
         byte[] bindOpaqueData,
+        byte[] outputSchema,
+        byte[] pushdownFilters,
         byte[] token,
         long estimatedBytes,
         String[] addresses) implements InputPartition {

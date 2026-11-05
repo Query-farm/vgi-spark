@@ -132,7 +132,7 @@ public final class VgiNativeScanResolver {
      *         dependency (Iceberg) isn't on this Spark cluster's classpath
      */
     public static Table resolve(String tableDisplayName, VgiNativeScanBranch branch,
-            List<List<String>> requiredFilters, boolean acknowledgeRequiredFilters) {
+            List<List<List<String>>> requiredFilters, boolean acknowledgeRequiredFilters) {
         if (requiredFilters != null && !requiredFilters.isEmpty() && !acknowledgeRequiredFilters) {
             throw new IllegalStateException(tableDisplayName + ": natively delegates to '"
                     + branch.functionName() + "' and declares required_filters " + requiredFilters

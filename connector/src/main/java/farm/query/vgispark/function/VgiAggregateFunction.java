@@ -76,7 +76,7 @@ import java.util.List;
 final class VgiAggregateFunction implements AggregateFunction<VgiAggState, Object> {
 
     private final VgiCatalogConfig config;
-    private final String schemaName;
+    private final List<String> schemaPath;
     private final String functionName;
     private final byte[] argsSchemaBytes;
     private final DataType[] inputTypes;
@@ -90,10 +90,10 @@ final class VgiAggregateFunction implements AggregateFunction<VgiAggState, Objec
     private transient boolean taskListenerRegistered;
     private transient long nextGroupId;
 
-    VgiAggregateFunction(VgiCatalogConfig config, String schemaName, String functionName, byte[] argsSchemaBytes,
+    VgiAggregateFunction(VgiCatalogConfig config, List<String> schemaPath, String functionName, byte[] argsSchemaBytes,
             DataType[] inputTypes, DataType returnType, boolean deterministic) {
         this.config = config;
-        this.schemaName = schemaName;
+        this.schemaPath = List.copyOf(schemaPath);
         this.functionName = functionName;
         this.argsSchemaBytes = argsSchemaBytes;
         this.inputTypes = inputTypes;
@@ -194,8 +194,8 @@ final class VgiAggregateFunction implements AggregateFunction<VgiAggState, Objec
 
             byte[] inputBatch = writeSingleBatch(root);
             AggregateUpdateRequest request = new AggregateUpdateRequest(
-                    functionName, executionId, inputBatch, connection.handle(), schemaName);
-            connection.service().aggregate_update(request);
+                    functionName, executionId, inputBatch, connection.handle(), schemaPath);
+            connection.service().aggregate_update(request, null);
         }
     }
 
@@ -211,8 +211,8 @@ final class VgiAggregateFunction implements AggregateFunction<VgiAggState, Objec
             groupIdsBatch = writeSingleBatch(root);
         }
         AggregateFinalizeRequest request = new AggregateFinalizeRequest(
-                functionName, executionId, groupIdsBatch, outputSchemaBytes, connection.handle(), schemaName);
-        AggregateFinalizeResponse response = connection.service().aggregate_finalize(request);
+                functionName, executionId, groupIdsBatch, outputSchemaBytes, connection.handle(), schemaPath);
+        AggregateFinalizeResponse response = connection.service().aggregate_finalize(request, null);
         return response.result_batch();
     }
 
@@ -230,8 +230,8 @@ final class VgiAggregateFunction implements AggregateFunction<VgiAggState, Objec
                 groupIdsBatch = writeSingleBatch(root);
             }
             AggregateDestructorRequest request = new AggregateDestructorRequest(
-                    functionName, executionId, groupIdsBatch, connection.handle(), schemaName);
-            connection.service().aggregate_destructor(request);
+                    functionName, executionId, groupIdsBatch, connection.handle(), schemaPath);
+            connection.service().aggregate_destructor(request, null);
         } catch (RuntimeException ignore) {
             // Best-effort cleanup — a group's worker-side state outliving this
             // call is a resource leak on the worker, never a correctness
@@ -283,8 +283,8 @@ final class VgiAggregateFunction implements AggregateFunction<VgiAggState, Objec
         }
         byte[] emptyArguments = ArgumentsEncoder.builder().encode();
         AggregateBindRequest request = new AggregateBindRequest(
-                functionName, emptyArguments, argsSchemaBytes, null, null, connection.handle(), schemaName);
-        AggregateBindResponse response = connection.service().aggregate_bind(request);
+                functionName, emptyArguments, argsSchemaBytes, null, null, connection.handle(), schemaPath);
+        AggregateBindResponse response = connection.service().aggregate_bind(request, null);
         executionId = response.execution_id();
         outputSchemaBytes = response.output_schema();
     }

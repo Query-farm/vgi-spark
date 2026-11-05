@@ -44,17 +44,17 @@ import java.util.Map;
 final class VgiUnboundAggregateFunction implements UnboundFunction {
 
     private final VgiCatalogConfig config;
-    private final String schemaName;
+    private final List<String> schemaPath;
     private final FunctionInfo info;
     private final byte[] argsSchemaBytes;
     private final DataType[] inputTypes;
     private final DataType returnType;
     private final boolean deterministic;
 
-    private VgiUnboundAggregateFunction(VgiCatalogConfig config, String schemaName, FunctionInfo info,
+    private VgiUnboundAggregateFunction(VgiCatalogConfig config, List<String> schemaPath, FunctionInfo info,
             byte[] argsSchemaBytes, DataType[] inputTypes, DataType returnType, boolean deterministic) {
         this.config = config;
-        this.schemaName = schemaName;
+        this.schemaPath = List.copyOf(schemaPath);
         this.info = info;
         this.argsSchemaBytes = argsSchemaBytes;
         this.inputTypes = inputTypes;
@@ -75,11 +75,11 @@ final class VgiUnboundAggregateFunction implements UnboundFunction {
     @Override
     public BoundFunction bind(StructType inputSchema) {
         if (inputSchema.length() != inputTypes.length) {
-            throw new UnsupportedOperationException(schemaName + "." + info.name() + " takes "
+            throw new UnsupportedOperationException(String.join(".", schemaPath) + "." + info.name() + " takes "
                     + inputTypes.length + " argument(s), got " + inputSchema.length());
         }
         return new VgiAggregateFunction(
-                config, schemaName, info.name(), argsSchemaBytes, inputTypes, returnType, deterministic);
+                config, schemaPath, info.name(), argsSchemaBytes, inputTypes, returnType, deterministic);
     }
 
     /**
@@ -89,8 +89,8 @@ final class VgiUnboundAggregateFunction implements UnboundFunction {
      * argument" assumption (a nullary aggregate is a real, valid VGI shape).
      */
     static VgiUnboundAggregateFunction tryBuild(
-            VgiWorkerClient client, VgiCatalogConfig config, String schemaName, FunctionInfo info) {
-        String context = schemaName + "." + info.name();
+            VgiWorkerClient client, VgiCatalogConfig config, List<String> schemaPath, FunctionInfo info) {
+        String context = String.join(".", schemaPath) + "." + info.name();
         Schema argsSchema = ArrowSchemaCodec.deserializeSchema(info.arguments());
         List<Field> argFields = argsSchema == null ? List.of() : argsSchema.getFields();
         DataType[] inputTypes = new DataType[argFields.size()];
@@ -163,7 +163,7 @@ final class VgiUnboundAggregateFunction implements UnboundFunction {
         // constant-fold or otherwise assume repeated calls agree.
         boolean deterministic = info.stability() == null || "CONSISTENT".equals(info.stability());
 
-        return new VgiUnboundAggregateFunction(config, schemaName, info,
+        return new VgiUnboundAggregateFunction(config, schemaPath, info,
                 info.arguments(), inputTypes, returnType, deterministic);
     }
 }

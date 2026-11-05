@@ -36,10 +36,11 @@ public final class VgiAggregateFunctions {
      * @return the identifiers, in the worker's own order
      */
     public static Identifier[] listFunctions(VgiWorkerClient client, String[] namespace) {
-        if (namespace.length != 1) return new Identifier[0];
-        String schemaName = namespace[0];
+        if (namespace.length == 0) return new Identifier[0];
+        List<String> schemaPath = List.of(namespace);
         ItemsResponse resp = client.withConnection(a -> a.service()
-                .catalog_schema_contents_functions(a.handle(), schemaName, "AGGREGATE_FUNCTION", null, null));
+                .catalog_schema_contents_functions(
+                        a.handle(), schemaPath, "AGGREGATE_FUNCTION", null, null));
         List<Identifier> out = new ArrayList<>(resp.items().size());
         for (byte[] item : resp.items()) {
             FunctionInfo info = RecordCodec.deserializeFromBytes(item, FunctionInfo.class);
@@ -49,7 +50,7 @@ public final class VgiAggregateFunctions {
             // to the RPC call's own uppercase "AGGREGATE_FUNCTION" category
             // constant.
             if (!"aggregate".equalsIgnoreCase(info.function_type())) continue;
-            out.add(Identifier.of(new String[] {schemaName}, info.name()));
+            out.add(Identifier.of(info.schema_path().toArray(String[]::new), info.name()));
         }
         return out.toArray(new Identifier[0]);
     }
@@ -72,21 +73,22 @@ public final class VgiAggregateFunctions {
      */
     public static UnboundFunction loadFunction(VgiWorkerClient client, VgiCatalogConfig config, Identifier ident)
             throws NoSuchFunctionException {
-        String schemaName;
-        if (ident.namespace().length == 1) {
-            schemaName = ident.namespace()[0];
+        List<String> schemaPath;
+        if (ident.namespace().length > 0) {
+            schemaPath = List.of(ident.namespace());
         } else if (ident.namespace().length == 0 && client.defaultSchema() != null) {
-            schemaName = client.defaultSchema();
+            schemaPath = List.of(client.defaultSchema());
         } else {
             throw new NoSuchFunctionException(ident);
         }
         String functionName = ident.name();
         ItemsResponse resp = client.withConnection(a -> a.service()
-                .catalog_schema_contents_functions(a.handle(), schemaName, "AGGREGATE_FUNCTION", null, null));
+                .catalog_schema_contents_functions(
+                        a.handle(), schemaPath, "AGGREGATE_FUNCTION", null, null));
         for (byte[] item : resp.items()) {
             FunctionInfo info = RecordCodec.deserializeFromBytes(item, FunctionInfo.class);
             if (info.name().equalsIgnoreCase(functionName) && "aggregate".equalsIgnoreCase(info.function_type())) {
-                return VgiUnboundAggregateFunction.tryBuild(client, config, schemaName, info);
+                return VgiUnboundAggregateFunction.tryBuild(client, config, schemaPath, info);
             }
         }
         throw new NoSuchFunctionException(ident);

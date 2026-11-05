@@ -3,6 +3,7 @@
 package farm.query.vgispark;
 
 import farm.query.vgispark.branch.VgiBranch;
+import farm.query.vgispark.branch.VgiScanBranch;
 import farm.query.vgispark.client.VgiWorkerClient;
 import farm.query.vgispark.scan.VgiScanBuilder;
 import farm.query.vgispark.types.ArrowSchemaCodec;
@@ -28,7 +29,7 @@ import java.util.Set;
  * Trino splits into a separate {@code ConnectorMetadata} for column/type
  * lookups, since Spark's {@link Table} is itself the unit that carries both.
  *
- * @param schemaName the VGI schema this table lives in
+ * @param schemaPath the raw VGI schema path this table lives in
  * @param tableName the table name
  * @param branches one or more physical sources unioned to produce this
  *        table's rows — a single-scan table (the common case, via the legacy
@@ -48,7 +49,7 @@ import java.util.Set;
  *        {@code atUnit} is {@code null} (VGI requires both or neither)
  * @param requiredFilters required WHERE-filter groups in conjunctive normal
  *        form ({@code TableInfo.required_filters}: an AND of OR-groups, each
- *        inner group a list of dotted column paths satisfied when any one of
+ *        inner group a list of component-preserving column paths satisfied when any one of
  *        its paths has a filter pushed). Empty means no enforcement. See
  *        {@code VgiScanBuilder} for where this is checked, fail-closed,
  *        against whatever {@code VgiFilterTranslator} actually manages to
@@ -59,14 +60,14 @@ import java.util.Set;
  * @param config this catalog's configuration
  */
 public record VgiTable(
-        String schemaName,
+        List<String> schemaPath,
         String tableName,
         List<VgiBranch> branches,
         byte[] outputSchemaBytes,
         Long cardinalityEstimate,
         String atUnit,
         String atValue,
-        java.util.List<java.util.List<String>> requiredFilters,
+        java.util.List<java.util.List<java.util.List<String>>> requiredFilters,
         VgiWorkerClient client,
         VgiCatalogConfig config) implements Table, SupportsRead {
 
@@ -77,7 +78,21 @@ public record VgiTable(
 
     @Override
     public String name() {
-        return schemaName + "." + tableName;
+        return schemaName() + "." + tableName;
+    }
+
+    /** Human-readable schema path for Spark diagnostics and display names. */
+    public String schemaName() {
+        return String.join(".", schemaPath);
+    }
+
+    /** Compatibility constructor for tests and single-level callers. */
+    public VgiTable(String schemaName, String tableName, List<VgiBranch> branches,
+            byte[] outputSchemaBytes, Long cardinalityEstimate, String atUnit, String atValue,
+            java.util.List<java.util.List<java.util.List<String>>> requiredFilters,
+            VgiWorkerClient client, VgiCatalogConfig config) {
+        this(List.of(schemaName), tableName, branches, outputSchemaBytes, cardinalityEstimate,
+                atUnit, atValue, requiredFilters, client, config);
     }
 
     // Table.schema() is deprecated in favor of columns() as of Spark 4.x —
@@ -139,5 +154,21 @@ public record VgiTable(
             out.put(VgiColumnNames.displayName(fields.get(i)), i);
         }
         return out;
+    }
+
+    /**
+     * Whether every RPC-backed branch explicitly accepts protocol 3 pushed
+     * filters. A missing catalog entry is treated conservatively as disabled;
+     * Spark will still evaluate the original predicate itself.
+     */
+    public boolean supportsFilterPushdown() {
+        boolean sawRpcBranch = false;
+        for (VgiBranch branch : branches) {
+            if (!(branch instanceof VgiScanBranch scan)) continue;
+            sawRpcBranch = true;
+            var info = client.scanFunctionInfo(scan.functionName());
+            if (info == null || !Boolean.TRUE.equals(info.filter_pushdown())) return false;
+        }
+        return sawRpcBranch;
     }
 }

@@ -2,7 +2,6 @@
 
 package farm.query.vgispark.scan;
 
-import farm.query.vgi.client.EncodedPushdownFilters;
 import farm.query.vgispark.VgiCatalogConfig;
 import farm.query.vgispark.VgiTable;
 import farm.query.vgispark.client.VgiWorkerClient;
@@ -114,17 +113,24 @@ public final class VgiScanBuilder implements ScanBuilder,
         this.pushedPredicates = filterResult.pushedPredicates();
         checkRequiredFilters(filterResult);
         List<Integer> projectionIds = projectionIds();
-        EncodedPushdownFilters encoded = filterResult.encoded();
-        byte[] pushdownFiltersBytes = encoded == null ? null : encoded.pushdownFilters();
         Long rowLimit = limit < 0 ? null : limit;
-        return new VgiScan(client, config, table, projectionIds, pushdownFiltersBytes, rowLimit);
+        Predicate[] filtersForExecution = filterResult.isEmpty() ? new Predicate[0] : rawPredicates;
+        return new VgiScan(client, config, table, projectionIds, filtersForExecution, rowLimit);
     }
 
     /** Translate {@link #rawPredicates} against the CURRENT projection (see class javadoc for why this is re-run). */
     private VgiFilterTranslator.Result translate() {
         Schema arrow = table.outputSchema();
         List<Field> fields = arrow == null ? List.of() : arrow.getFields();
-        return VgiFilterTranslator.translate(rawPredicates, fields, projectedWireNames());
+        boolean hasRequiredFilters = table.requiredFilters() != null && !table.requiredFilters().isEmpty();
+        // A declarative table's internal backing function can be intentionally
+        // absent from public FunctionInfo discovery. In that case the table's
+        // required_filters contract is itself the signal that a usable filter
+        // must be sent; the worker still validates ownership at plan/init.
+        if (!table.supportsFilterPushdown() && !hasRequiredFilters) {
+            return VgiFilterTranslator.translate(new Predicate[0], fields, fields, projectedWireNames());
+        }
+        return VgiFilterTranslator.translate(rawPredicates, fields, fields, projectedWireNames());
     }
 
     /**
@@ -191,11 +197,13 @@ public final class VgiScanBuilder implements ScanBuilder,
      * unbounded scan.
      */
     private void checkRequiredFilters(VgiFilterTranslator.Result filterResult) {
-        List<List<String>> requiredGroups = table.requiredFilters();
+        List<List<List<String>>> requiredGroups = table.requiredFilters();
         if (requiredGroups == null || requiredGroups.isEmpty()) return;
-        java.util.Set<String> covered = filterResult.coveredColumns();
-        for (List<String> group : requiredGroups) {
-            boolean satisfied = group.stream().anyMatch(covered::contains);
+        java.util.Set<List<String>> covered = filterResult.coveredColumns();
+        for (List<List<String>> group : requiredGroups) {
+            boolean satisfied = group.stream().anyMatch(required -> covered.stream().anyMatch(
+                    present -> present.size() <= required.size()
+                            && required.subList(0, present.size()).equals(present)));
             if (!satisfied) {
                 throw new IllegalStateException("table '" + table.schemaName() + "." + table.tableName()
                         + "' requires a filter on one of " + group + " — this worker refuses to scan without "

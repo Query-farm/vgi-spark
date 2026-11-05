@@ -43,10 +43,10 @@ class VgiFilterTranslatorTest {
     @Test
     void translatesASimpleComparison() {
         Predicate p = cmp(">", "n", 5L, DataTypes.LongType);
-        VgiFilterTranslator.Result result = VgiFilterTranslator.translate(new Predicate[] {p}, SCHEMA, PROJECTED);
+        VgiFilterTranslator.Result result = VgiFilterTranslator.translate(new Predicate[] {p}, SCHEMA, SCHEMA, PROJECTED);
 
         assertTrue(!result.isEmpty(), "expected the comparison to translate");
-        assertEquals(Set.of("n"), result.coveredColumns());
+        assertEquals(Set.of(List.of("n")), result.coveredColumns());
         assertEquals(1, result.pushedPredicates().length);
         EncodedPushdownFilters encoded = result.encoded();
         assertNotNull(encoded.pushdownFilters());
@@ -58,20 +58,20 @@ class VgiFilterTranslatorTest {
         // "5 < n" means "n > 5" — same predicate, operands reversed.
         Predicate p = new Predicate("<", new Expression[] {
                 new LiteralValue<>(5L, DataTypes.LongType), FieldReference.column("n")});
-        VgiFilterTranslator.Result result = VgiFilterTranslator.translate(new Predicate[] {p}, SCHEMA, PROJECTED);
+        VgiFilterTranslator.Result result = VgiFilterTranslator.translate(new Predicate[] {p}, SCHEMA, SCHEMA, PROJECTED);
 
         assertTrue(!result.isEmpty(), "expected the flipped comparison to translate");
-        assertEquals(Set.of("n"), result.coveredColumns());
+        assertEquals(Set.of(List.of("n")), result.coveredColumns());
     }
 
     @Test
     void translatesAnAndOfTwoComparisonsOnTheSameColumn() {
         Predicate p = new Predicate("AND", new Expression[] {
                 cmp(">", "n", 90L, DataTypes.LongType), cmp("<=", "n", 95L, DataTypes.LongType)});
-        VgiFilterTranslator.Result result = VgiFilterTranslator.translate(new Predicate[] {p}, SCHEMA, PROJECTED);
+        VgiFilterTranslator.Result result = VgiFilterTranslator.translate(new Predicate[] {p}, SCHEMA, SCHEMA, PROJECTED);
 
         assertTrue(!result.isEmpty(), "expected a same-column AND to translate");
-        assertEquals(Set.of("n"), result.coveredColumns());
+        assertEquals(Set.of(List.of("n")), result.coveredColumns());
     }
 
     @Test
@@ -80,7 +80,7 @@ class VgiFilterTranslatorTest {
         // column-rooted, and this predicate's descendants name two columns.
         Predicate p = new Predicate("OR", new Expression[] {
                 cmp(">", "n", 5L, DataTypes.LongType), cmp("=", "name", "x", DataTypes.StringType)});
-        VgiFilterTranslator.Result result = VgiFilterTranslator.translate(new Predicate[] {p}, SCHEMA, PROJECTED);
+        VgiFilterTranslator.Result result = VgiFilterTranslator.translate(new Predicate[] {p}, SCHEMA, SCHEMA, PROJECTED);
 
         assertTrue(result.isEmpty(), "a cross-column OR must not translate");
         assertEquals(Set.of(), result.coveredColumns());
@@ -91,7 +91,8 @@ class VgiFilterTranslatorTest {
     @Test
     void rejectsAFilterOnAColumnNotInTheProjection() {
         Predicate p = cmp("=", "name", "x", DataTypes.StringType);
-        VgiFilterTranslator.Result result = VgiFilterTranslator.translate(new Predicate[] {p}, SCHEMA, List.of("n"));
+        VgiFilterTranslator.Result result = VgiFilterTranslator.translate(
+                new Predicate[] {p}, SCHEMA, SCHEMA, List.of("n"));
 
         assertTrue(result.isEmpty(), "a filter on a non-projected column must not translate");
     }
@@ -104,7 +105,7 @@ class VgiFilterTranslatorTest {
                 FieldReference.column("n"), new LiteralValue<>(1L, DataTypes.LongType)});
         Predicate translatable = cmp("=", "n", 5L, DataTypes.LongType);
         VgiFilterTranslator.Result result = VgiFilterTranslator.translate(
-                new Predicate[] {untranslatable, translatable}, SCHEMA, PROJECTED);
+                new Predicate[] {untranslatable, translatable}, SCHEMA, SCHEMA, PROJECTED);
 
         assertTrue(!result.isEmpty());
         assertEquals(1, result.pushedPredicates().length);

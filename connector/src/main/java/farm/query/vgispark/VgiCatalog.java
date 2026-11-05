@@ -99,51 +99,41 @@ public final class VgiCatalog implements TableCatalog, SupportsNamespaces, Funct
     }
 
     // ------------------------------------------------------------------
-    // SupportsNamespaces — VGI schemas are single-level; there is no nested
-    // namespace concept, so every namespace-typed argument here is expected
-    // to be either zero-length (the catalog root) or exactly one element (a
-    // schema name).
+    // SupportsNamespaces — Spark and VGI 3.0 both preserve namespace path
+    // components, so nested paths are passed without joining or splitting.
     // ------------------------------------------------------------------
 
     @Override
     public String[][] listNamespaces() {
-        return client.withConnection(a -> {
-            List<String[]> out = new ArrayList<>();
-            for (byte[] item : a.service().catalog_schemas(a.handle(), null).items()) {
-                out.add(new String[] {RecordCodec.deserializeFromBytes(item, SchemaInfo.class).name()});
-            }
-            return out.toArray(new String[0][]);
-        });
+        return listNamespaceChildren(new String[0]);
     }
 
     @Override
     public String[][] listNamespaces(String[] namespace) throws NoSuchNamespaceException {
-        if (namespace.length == 0) {
-            return listNamespaces();
-        }
+        if (namespace.length == 0) return listNamespaces();
         if (!namespaceExists(namespace)) {
             throw new NoSuchNamespaceException(namespace);
         }
-        // VGI schemas have no nested sub-namespaces.
-        return new String[0][];
+        return listNamespaceChildren(namespace);
     }
 
     @Override
     public boolean namespaceExists(String[] namespace) {
-        if (namespace.length != 1) return false;
+        if (namespace.length == 0) return false;
         return client.withConnection(a ->
-                !a.service().catalog_schema_get(a.handle(), namespace[0], null).items().isEmpty());
+                !a.service().catalog_schema_get(a.handle(), List.of(namespace), null, null).items().isEmpty());
     }
 
     @Override
     public Map<String, String> loadNamespaceMetadata(String[] namespace) throws NoSuchNamespaceException {
-        if (namespace.length != 1) {
+        if (namespace.length == 0) {
             throw new NoSuchNamespaceException(namespace);
         }
         // The checked NoSuchNamespaceException below can't be thrown from
         // inside withConnection's plain Function<Attached, T> lambda, so the
         // RPC result is fetched first and the exception thrown afterward.
-        ItemsResponse resp = client.withConnection(a -> a.service().catalog_schema_get(a.handle(), namespace[0], null));
+        ItemsResponse resp = client.withConnection(a ->
+                a.service().catalog_schema_get(a.handle(), List.of(namespace), null, null));
         if (resp.items().isEmpty()) {
             throw new NoSuchNamespaceException(namespace);
         }
@@ -173,15 +163,16 @@ public final class VgiCatalog implements TableCatalog, SupportsNamespaces, Funct
 
     @Override
     public Identifier[] listTables(String[] namespace) throws NoSuchNamespaceException {
-        if (namespace.length != 1) {
+        if (namespace.length == 0) {
             throw new NoSuchNamespaceException(namespace);
         }
         return client.withConnection(a -> {
-            ItemsResponse tables = a.service().catalog_schema_contents_tables(a.handle(), namespace[0], null, null);
+            ItemsResponse tables = a.service().catalog_schema_contents_tables(
+                    a.handle(), List.of(namespace), null, null);
             List<Identifier> out = new ArrayList<>(tables.items().size());
             for (byte[] item : tables.items()) {
                 TableInfo info = TableInfoDecoder.decode(item);
-                out.add(Identifier.of(new String[] {info.schema_name()}, info.name()));
+                out.add(Identifier.of(info.schema_path().toArray(String[]::new), info.name()));
             }
             return out.toArray(new Identifier[0]);
         });
@@ -221,7 +212,8 @@ public final class VgiCatalog implements TableCatalog, SupportsNamespaces, Funct
     }
 
     private Table loadTable(Identifier ident, String atUnit, String atValue) throws NoSuchTableException {
-        String schemaName = schemaNameOf(ident);
+        List<String> schemaPath = schemaPathOf(ident);
+        String schemaName = String.join(".", schemaPath);
         String tableName = ident.name();
         // Same constraint as loadNamespaceMetadata above: the checked
         // NoSuchTableException can't be thrown from inside withConnection's
@@ -229,12 +221,13 @@ public final class VgiCatalog implements TableCatalog, SupportsNamespaces, Funct
         // (catalog_table_get, then catalog_table_scan_function_get) rather
         // than one connection held across both calls.
         ItemsResponse tableResp = client.withConnection(a ->
-                a.service().catalog_table_get(a.handle(), schemaName, tableName, atUnit, atValue, null, null));
+                a.service().catalog_table_get(
+                        a.handle(), schemaPath, tableName, atUnit, atValue, null, null));
         if (tableResp.items().isEmpty()) {
             throw new NoSuchTableException(ident);
         }
         TableInfo info = TableInfoDecoder.decode(tableResp.items().get(0));
-        List<VgiBranch> branches = resolveBranches(schemaName, tableName, atUnit, atValue);
+        List<VgiBranch> branches = resolveBranches(schemaPath, tableName, atUnit, atValue);
 
         // Native scan-function delegation (VgiNativeScanBranch's own javadoc):
         // a table that resolves to EXACTLY ONE native-delegating branch skips
@@ -247,11 +240,11 @@ public final class VgiCatalog implements TableCatalog, SupportsNamespaces, Funct
         // multi-branch model has no established way to union rows from a
         // Spark-native Scan with rows from a VgiScan-planned one.
         if (branches.size() == 1 && branches.get(0) instanceof VgiNativeScanBranch nativeBranch) {
-            return VgiNativeScanResolver.resolve(info.schema_name() + "." + info.name(), nativeBranch,
+            return VgiNativeScanResolver.resolve(String.join(".", info.schema_path()) + "." + info.name(), nativeBranch,
                     info.required_filters(), config.acknowledgeNativeScanRequiredFilters());
         }
 
-        return new VgiTable(info.schema_name(), info.name(), branches,
+        return new VgiTable(info.schema_path(), info.name(), branches,
                 info.columns(), info.cardinality_estimate(), atUnit, atValue, info.required_filters(),
                 client, config);
     }
@@ -279,16 +272,17 @@ public final class VgiCatalog implements TableCatalog, SupportsNamespaces, Funct
      * intercepts a single-native-branch result before ever constructing a
      * {@link VgiTable}.
      */
-    private List<VgiBranch> resolveBranches(String schemaName, String tableName, String atUnit, String atValue) {
+    private List<VgiBranch> resolveBranches(List<String> schemaPath, String tableName, String atUnit, String atValue) {
+        String schemaName = String.join(".", schemaPath);
         byte[] branchesResponse;
         try {
             branchesResponse = client.withConnection(a ->
                     a.service().catalog_table_scan_branches_get(
-                            a.handle(), schemaName, tableName, atUnit, atValue, null, null));
+                            a.handle(), schemaPath, tableName, atUnit, atValue, null, null));
         } catch (MethodNotImplementedError notMultiBranch) {
             TableScanFunctionGetResponse scan = client.withConnection(a ->
                     a.service().catalog_table_scan_function_get(
-                            a.handle(), schemaName, tableName, atUnit, atValue, null, null));
+                            a.handle(), schemaPath, tableName, atUnit, atValue, null, null));
             if (VgiNativeScanResolver.isNativeScanFunction(scan.function_name())) {
                 return List.of(new VgiNativeScanBranch(
                         scan.function_name(), ScanFunctionArguments.decode(scan.arguments())));
@@ -422,16 +416,22 @@ public final class VgiCatalog implements TableCatalog, SupportsNamespaces, Funct
         return VgiTableProcedures.loadProcedure(client, config, ident);
     }
 
-    /**
-     * VGI has a single-level namespace (schema), so an {@link Identifier}'s
-     * namespace must be exactly one element — a Spark identifier like
-     * {@code catalog.a.b.table} (a multi-level namespace) can never resolve
-     * to a real VGI table.
-     */
-    private static String schemaNameOf(Identifier ident) throws NoSuchTableException {
-        if (ident.namespace().length != 1) {
+    private String[][] listNamespaceChildren(String[] parent) {
+        return client.withConnection(a -> {
+            java.util.LinkedHashSet<List<String>> children = new java.util.LinkedHashSet<>();
+            for (byte[] item : a.service().catalog_schemas(a.handle(), null, null).items()) {
+                List<String> path = RecordCodec.deserializeFromBytes(item, SchemaInfo.class).path();
+                if (path.size() != parent.length + 1) continue;
+                if (path.subList(0, parent.length).equals(List.of(parent))) children.add(path);
+            }
+            return children.stream().map(path -> path.toArray(String[]::new)).toArray(String[][]::new);
+        });
+    }
+
+    private static List<String> schemaPathOf(Identifier ident) throws NoSuchTableException {
+        if (ident.namespace().length == 0) {
             throw new NoSuchTableException(ident);
         }
-        return ident.namespace()[0];
+        return List.of(ident.namespace());
     }
 }

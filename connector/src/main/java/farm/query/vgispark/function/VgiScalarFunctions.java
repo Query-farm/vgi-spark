@@ -40,10 +40,11 @@ public final class VgiScalarFunctions {
      * @return the identifiers, in the worker's own order
      */
     public static Identifier[] listFunctions(VgiWorkerClient client, String[] namespace) {
-        if (namespace.length != 1) return new Identifier[0];
-        String schemaName = namespace[0];
+        if (namespace.length == 0) return new Identifier[0];
+        List<String> schemaPath = List.of(namespace);
         ItemsResponse resp = client.withConnection(a -> a.service()
-                .catalog_schema_contents_functions(a.handle(), schemaName, "SCALAR_FUNCTION", null, null));
+                .catalog_schema_contents_functions(
+                        a.handle(), schemaPath, "SCALAR_FUNCTION", null, null));
         // A java.util.LinkedHashSet-backed dedupe: an overloaded name (item 9)
         // has multiple FunctionInfo entries but should appear exactly once in
         // a listing (SHOW FUNCTIONS-style introspection), same as any other
@@ -51,7 +52,7 @@ public final class VgiScalarFunctions {
         java.util.LinkedHashSet<Identifier> out = new java.util.LinkedHashSet<>(resp.items().size());
         for (byte[] item : resp.items()) {
             FunctionInfo info = RecordCodec.deserializeFromBytes(item, FunctionInfo.class);
-            out.add(Identifier.of(new String[] {schemaName}, info.name()));
+            out.add(Identifier.of(info.schema_path().toArray(String[]::new), info.name()));
         }
         return out.toArray(new Identifier[0]);
     }
@@ -86,24 +87,25 @@ public final class VgiScalarFunctions {
      */
     public static UnboundFunction loadFunction(VgiWorkerClient client, VgiCatalogConfig config, Identifier ident)
             throws NoSuchFunctionException {
-        String schemaName;
-        if (ident.namespace().length == 1) {
-            schemaName = ident.namespace()[0];
+        List<String> schemaPath;
+        if (ident.namespace().length > 0) {
+            schemaPath = List.of(ident.namespace());
         } else if (ident.namespace().length == 0 && client.defaultSchema() != null) {
-            schemaName = client.defaultSchema();
+            schemaPath = List.of(client.defaultSchema());
         } else {
             throw new NoSuchFunctionException(ident);
         }
         String functionName = ident.name();
         ItemsResponse resp = client.withConnection(a -> a.service()
-                .catalog_schema_contents_functions(a.handle(), schemaName, "SCALAR_FUNCTION", null, null));
+                .catalog_schema_contents_functions(
+                        a.handle(), schemaPath, "SCALAR_FUNCTION", null, null));
         List<FunctionInfo> matches = new ArrayList<>();
         for (byte[] item : resp.items()) {
             FunctionInfo info = RecordCodec.deserializeFromBytes(item, FunctionInfo.class);
             if (info.name().equalsIgnoreCase(functionName)) matches.add(info);
         }
         if (matches.isEmpty()) throw new NoSuchFunctionException(ident);
-        if (matches.size() == 1) return VgiUnboundScalarFunction.tryBuild(client, config, schemaName, matches.get(0));
-        return new VgiOverloadedScalarFunction(client, config, schemaName, matches);
+        if (matches.size() == 1) return VgiUnboundScalarFunction.tryBuild(client, config, schemaPath, matches.get(0));
+        return new VgiOverloadedScalarFunction(client, config, schemaPath, matches);
     }
 }

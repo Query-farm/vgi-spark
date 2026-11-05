@@ -130,7 +130,7 @@ class VgiNativeScanResolverTest {
                 "read_parquet", decoded("/nonexistent", Map.of()));
         IllegalStateException e = Assertions.assertThrows(IllegalStateException.class, () ->
                 VgiNativeScanResolver.resolve(
-                        "places.place", branch, List.of(List.of("bbox.xmin")), false));
+                        "places.place", branch, List.of(List.of(List.of("bbox", "xmin"))), false));
         Assertions.assertTrue(e.getMessage().contains("acknowledge-native-scan-required-filters"),
                 e.getMessage());
     }
@@ -145,7 +145,7 @@ class VgiNativeScanResolverTest {
 
         VgiNativeScanBranch branch = new VgiNativeScanBranch("read_parquet", decoded(path, Map.of()));
         Table table = VgiNativeScanResolver.resolve(
-                "places.place", branch, List.of(List.of("bbox.xmin")), true);
+                "places.place", branch, List.of(List.of(List.of("bbox", "xmin"))), true);
         Assertions.assertNotNull(table);
     }
 
