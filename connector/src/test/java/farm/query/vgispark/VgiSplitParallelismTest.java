@@ -9,7 +9,11 @@ import farm.query.vgi.function.FunctionMetadata;
 import farm.query.vgi.internal.BatchUtil;
 import farm.query.vgi.internal.SchemaUtil;
 import farm.query.vgi.protocol.BindResponse;
+import farm.query.vgi.protocol.FieldPath;
+import farm.query.vgi.protocol.KeyGrouping;
 import farm.query.vgi.protocol.ScanSplit;
+import farm.query.vgi.protocol.TransformSpec;
+import farm.query.vgi.storage.BoundStorage;
 import farm.query.vgi.table.PlanRequest;
 import farm.query.vgi.table.PlanResult;
 import farm.query.vgi.table.TableBindParams;
@@ -19,7 +23,9 @@ import farm.query.vgi.table.TableProducerState;
 import farm.query.vgi.types.Schemas;
 import farm.query.vgirpc.CallContext;
 import farm.query.vgirpc.OutputCollector;
+import farm.query.vgirpc.marshal.RecordCodec;
 import org.apache.arrow.vector.BigIntVector;
+import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
@@ -59,17 +65,17 @@ class VgiSplitParallelismTest {
 
     private static final int PORT = 28479;
 
-    /** {@code [lo, hi)} owned by one split. */
-    private record Range(long lo, long hi) {}
+    /** {@code [lo, hi)} owned by one split, with one exact grouping key. */
+    private record Range(long lo, long hi, long bucket) {}
 
     private static byte[] encode(Range r) {
-        return ByteBuffer.allocate(16).order(ByteOrder.LITTLE_ENDIAN)
-                .putLong(r.lo()).putLong(r.hi()).array();
+        return ByteBuffer.allocate(24).order(ByteOrder.LITTLE_ENDIAN)
+                .putLong(r.lo()).putLong(r.hi()).putLong(r.bucket()).array();
     }
 
     private static Range decode(byte[] payload) {
         ByteBuffer b = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN);
-        return new Range(b.getLong(), b.getLong());
+        return new Range(b.getLong(), b.getLong(), b.getLong());
     }
 
     private static List<Range> evenRanges(long n, long k) {
@@ -79,7 +85,7 @@ class VgiSplitParallelismTest {
         long lo = 0;
         for (long i = 0; i < k; i++) {
             long hi = lo + base + (i < extra ? 1 : 0);
-            out.add(new Range(lo, hi));
+            out.add(new Range(lo, hi, i % 2));
             lo = hi;
         }
         return out;
@@ -88,7 +94,25 @@ class VgiSplitParallelismTest {
     /** Split-capable {@code split_seq(n, splits)}: emits {@code 0..n-1} divided into {@code splits} ranges. */
     public static final class SplitSeqFunction implements TableFunction {
 
-        static final Schema OUTPUT_SCHEMA = Schemas.of(Schemas.nullable("n", Schemas.INT64));
+        static final Schema OUTPUT_SCHEMA = Schemas.of(
+                Schemas.nullable("bucket", Schemas.INT64),
+                Schemas.nullable("n", Schemas.INT64));
+        static final byte[] KEY_GROUPING = RecordCodec.serializeToBytes(new KeyGrouping(List.of(
+                RecordCodec.serializeToBytes(new TransformSpec(
+                        "vgi.identity/1",
+                        List.of(RecordCodec.serializeToBytes(new FieldPath(List.of("bucket")))),
+                        null)))));
+
+        private static byte[] keyValue(long bucket) {
+            try (var allocator = new org.apache.arrow.memory.RootAllocator();
+                 VectorSchemaRoot root = VectorSchemaRoot.create(
+                         Schemas.of(Schemas.nullable("bucket", Schemas.INT64)), allocator)) {
+                root.allocateNew();
+                ((BigIntVector) root.getVector("bucket")).setSafe(0, bucket);
+                root.setRowCount(1);
+                return BoundStorage.serializeRecordBatch(root);
+            }
+        }
 
         @Override public String name() { return "split_seq_fn"; }
 
@@ -112,22 +136,22 @@ class VgiSplitParallelismTest {
             List<ScanSplit> all = new ArrayList<>();
             for (Range r : evenRanges(n, splits)) {
                 long rows = r.hi() - r.lo();
-                all.add(new ScanSplit(encode(r), new byte[0], rows, true, rows * 8,
-                        null, null, null, null, null));
+                all.add(new ScanSplit(encode(r), new byte[0], rows, true, rows * 16,
+                        keyValue(r.bucket()), null, null, null, null, null, null, null));
             }
             // Fan the enumeration out into two continuation branches. This
             // catches clients that incorrectly follow only next_cursors[0].
             if (request.cursor() == null || request.cursor().length == 0) {
                 return new PlanResult(List.of(all.get(0)),
                         List.of(new byte[] {1}, new byte[] {2}),
-                        null, (long) all.size(), n, 2L);
+                        null, (long) all.size(), n, 2L).withKeyGrouping(KEY_GROUPING);
             }
             int branch = Byte.toUnsignedInt(request.cursor()[0]);
             List<ScanSplit> page = branch == 1
                     ? all.subList(1, 3)
                     : branch == 2 ? all.subList(3, all.size()) : List.of();
             return new PlanResult(page, List.of(), null,
-                    (long) all.size(), n, 2L);
+                    (long) all.size(), n, 2L).withKeyGrouping(KEY_GROUPING);
         }
 
         @Override public TableProducerState createProducer(TableInitParams params) {
@@ -160,9 +184,16 @@ class VgiSplitParallelismTest {
             if (total == 0) { out.finish(); return; }
             BatchUtil.emit(SplitSeqFunction.OUTPUT_SCHEMA, total, out, (root, rows, ignored) -> {
                 BigIntVector v = (BigIntVector) root.getVector("n");
+                BigIntVector bucket = (BigIntVector) root.getVector("bucket");
                 v.allocateNew(rows);
+                bucket.allocateNew(rows);
                 int idx = 0;
-                for (Range r : ranges) for (long x = r.lo(); x < r.hi(); x++) v.set(idx++, x);
+                for (Range r : ranges) {
+                    for (long x = r.lo(); x < r.hi(); x++) {
+                        bucket.set(idx, r.bucket());
+                        v.set(idx++, x);
+                    }
+                }
             });
         }
     }
@@ -223,5 +254,25 @@ class VgiSplitParallelismTest {
         assertEquals(0L, row.getLong(1));
         assertEquals(96L, row.getLong(2));
         assertEquals(97L, row.getLong(3), "no split may double-count or drop a row");
+    }
+
+    @Test
+    @Timeout(120)
+    void realWorkerKeyGroupingReachesSparkPhysicalPlanning() {
+        var frame = spark.sql("SELECT bucket, n FROM vgi_split.main.split_seq");
+        var partitioning = frame.queryExecution().executedPlan().outputPartitioning();
+        var partitioningClass = partitioning.getClass().getSimpleName();
+        var partitioningText = partitioning.toString();
+        org.junit.jupiter.api.Assertions.assertTrue(
+                partitioningClass.contains("KeyGroupedPartitioning")
+                        || partitioningText.startsWith("keyedpartitioning("),
+                () -> "expected Spark key-grouped partitioning, got " + partitioningClass
+                        + ": " + partitioningText
+                        + "\n" + frame.queryExecution().executedPlan());
+        assertEquals(2, partitioning.numPartitions(),
+                "five splits with two grouping keys and max_workers=2 should coalesce by key");
+
+        var rows = frame.groupBy("bucket").count().orderBy("bucket").collectAsList();
+        assertEquals(List.of(58L, 39L), rows.stream().map(r -> r.getLong(1)).toList());
     }
 }
