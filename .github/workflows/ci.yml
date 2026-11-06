@@ -51,7 +51,7 @@ env:
   # corpus is used here (the sqllogictest conformance suite and full-corpus
   # sweep both just read these as plain text), never built. Pin the reviewed
   # Protocol 3.1 corpus from the native repository's v2.0 branch.
-  VGI_REF: 2890cd43c28431004dea5b06ea5760f4a4b9a611
+  VGI_REF: b3276d91fb2834578cbef437b1d62383fda3da32
   # The Rust worker this connector's own test suite runs against (see
   # CLAUDE.md's "Test worker: vgi-rust, not vgi-python") — deliberately kept
   # floating on `main`, unlike the other three refs above: always build
