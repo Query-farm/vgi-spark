@@ -46,12 +46,12 @@ env:
   # Central). Bump alongside a real vgi-spark change that needs the newer
   # commit, not routinely.
   VGI_JAVA_REF: e70bb43ec0ae72a83602b4474fb3bf80e0fecf5d
-  VGI_RPC_JAVA_REF: 00b1d1f43f19cda7d734047aae18380e1b2aa286
+  VGI_RPC_JAVA_REF: ae4f27859e68f20d4a1d39aa2d17819f1ef44b05
   # The DuckDB reference client repo — only its test/sql/integration/*.test
   # corpus is used here (the sqllogictest conformance suite and full-corpus
   # sweep both just read these as plain text), never built. Pin the reviewed
   # Protocol 3.1 corpus from the native repository's v2.0 branch.
-  VGI_REF: 257e59a29b12583d69493c0bcb47d672c1ae485f
+  VGI_REF: e5132b0394215e8fcf3b880fdf4ad7fe26bd552d
   # The Rust worker this connector's own test suite runs against (see
   # CLAUDE.md's "Test worker: vgi-rust, not vgi-python") — deliberately kept
   # floating on `main`, unlike the other three refs above: always build
