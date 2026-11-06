@@ -29,13 +29,16 @@
 FROM eclipse-temurin:21-jdk
 
 ARG SPARK_VERSION=4.2.0
+ARG SPARK_SHA512=3a6559e8546ff387db8fe7a04b8fe4008853b467b972c2e343df8e14a81450534777719fc5d4998dd96519a86fdf9de140cee753c61e2e94db044d5f9555ddc4
 ENV SPARK_HOME=/opt/spark
 ENV PATH="${SPARK_HOME}/bin:${SPARK_HOME}/sbin:${PATH}"
 
 RUN apt-get update && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/* \
-    && curl -sSL "https://dlcdn.apache.org/spark/spark-${SPARK_VERSION}/spark-${SPARK_VERSION}-bin-hadoop3.tgz" \
+    && curl -fsSL --retry 3 --retry-all-errors \
+        "https://archive.apache.org/dist/spark/spark-${SPARK_VERSION}/spark-${SPARK_VERSION}-bin-hadoop3.tgz" \
         -o /tmp/spark.tgz \
+    && echo "${SPARK_SHA512}  /tmp/spark.tgz" | sha512sum -c - \
     && mkdir -p "${SPARK_HOME}" \
     && tar -xzf /tmp/spark.tgz -C "${SPARK_HOME}" --strip-components=1 \
     && rm /tmp/spark.tgz
