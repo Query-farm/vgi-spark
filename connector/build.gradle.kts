@@ -125,7 +125,7 @@ val assembleDeployDir by tasks.registering(Copy::class) {
     })
     into(layout.buildDirectory.dir("deploy"))
     // Stale outputs (e.g. an old connector-0.2.0.jar sitting next to a
-    // fresh connector-0.3.0.jar after a version bump) are exactly what let
+    // fresh connector-0.4.0.jar after a version bump) are exactly what let
     // the bug above hide -- start every run from a clean directory instead
     // of merging into whatever a previous run left behind.
     doFirst { delete(layout.buildDirectory.dir("deploy")) }

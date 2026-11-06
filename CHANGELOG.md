@@ -6,8 +6,13 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-11-05
+
 ### Added
 
+- Protocol 3.1 key-grouped split planning. Exact worker-provided partition
+  keys now reach Spark's key-grouped partitioning API, with pagination,
+  locality, split fanout, and worker concurrency limits validated end to end.
 - Native scan-function delegation: a table backed by a `read_parquet`/
   `read_csv`/`iceberg_scan`-delegating worker (VGI's own mechanism — the
   worker names a well-known reader instead of hosting a function) is now read
@@ -68,6 +73,7 @@ follows [Semantic Versioning](https://semver.org/).
   `CLAUDE.md`'s own writeup for the full root cause (a raw Kotlin lambda
   Gradle's `CopySpec` silently doesn't resolve) and fix.
 
+[0.4.0]: https://github.com/Query-farm/vgi-spark/releases/tag/v0.4.0
 [0.3.0]: https://github.com/Query-farm/vgi-spark/releases/tag/v0.3.0
 
 ## [0.2.0] — 2026-08-27
