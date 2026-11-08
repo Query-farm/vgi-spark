@@ -19,14 +19,16 @@ import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 
 /**
  * Protocol 3.2 filtered scan planning, end to end against {@code
  * vgi-example-worker}'s {@code data.planned_days} fixture: a {@code
  * scan_planning = "filtered"} table that redirects to {@code
- * read_parquet([...one file per day...])} and records each planning call in
- * {@code $VGI_TEST_BRANCH_DIR/planned_days/last_plan.json}.
+ * read_parquet([...one file per day...])}. Day files live at {@code
+ * $VGI_TEST_BRANCH_DIR/planned_days_<day>.parquet}; the worker records a
+ * planning call in {@code planned_days_last_plan.json} only when it carried
+ * predicates.
  *
  * <p>vgi-spark resolves branches in {@code TableCatalog.loadTable}, before
  * Spark has any predicate, so it always sends {@code pushdown_filters =
@@ -66,7 +68,7 @@ class VgiScanPlanningTest {
                     .selectExpr("DATE '2026-10-0" + day + "' AS event_date",
                             "CAST(id + " + (day - 1) * 10 + " AS BIGINT) AS n")
                     .write()
-                    .parquet(branchDir.resolve("planned_days").resolve("2026-10-0" + day + ".parquet").toString());
+                    .parquet(branchDir.resolve("planned_days_2026-10-0" + day + ".parquet").toString());
         }
     }
 
@@ -76,9 +78,6 @@ class VgiScanPlanningTest {
         if (worker != null) worker.teardown().close();
     }
 
-    private String lastPlan() throws Exception {
-        return Files.readString(branchDir.resolve("planned_days").resolve("last_plan.json"));
-    }
 
     @Test
     @Timeout(60)
@@ -88,9 +87,9 @@ class VgiScanPlanningTest {
         assertEquals(50L, row.getLong(0));
         assertEquals(1225L, row.getLong(1));
 
-        String plan = lastPlan().replace(" ", "");
-        assertTrue(plan.contains("\"received_filters\":false"), plan);
-        assertTrue(plan.contains("\"2026-10-05\""), "all five days expected without pushdown: " + plan);
+        // vgi-spark sends no predicates, so the worker never records a filtered plan.
+        assertFalse(Files.exists(branchDir.resolve("planned_days_last_plan.json")),
+                "no planning call should have carried predicates");
     }
 
     @Test
