@@ -48,11 +48,9 @@ env:
   #
   # PROTOCOL 3.2 (vgi-spark 0.5.0): this connector now needs vgi-java 0.47.0
   # (protocol vgi.v3 3.2.0 — catalog_table_scan_branches_get's trailing
-  # pushdown_filters, TableInfo.scan_planning). The pin below is still the
-  # 3.1 commit because the 3.2 commit isn't pushed yet; replace it with the
-  # vgi-java v0.47.0 release commit before merging. Validated locally against
-  # vgi-java feat/protocol-3.2-scan-planning cf9c354 (version set to 0.47.0).
-  VGI_JAVA_REF: e70bb43ec0ae72a83602b4474fb3bf80e0fecf5d
+  # pushdown_filters, TableInfo.scan_planning). Pinned to the vgi-java
+  # v0.47.0 release commit.
+  VGI_JAVA_REF: 7865fe2c74428dac753a7e19c93de6fa6ce684b3
   VGI_RPC_JAVA_REF: ae4f27859e68f20d4a1d39aa2d17819f1ef44b05
   # The DuckDB reference client repo — only its test/sql/integration/*.test
   # corpus is used here (the sqllogictest conformance suite and full-corpus
@@ -62,7 +60,7 @@ env:
   # catalog/scan_planning_*.test) once pushed — validated locally against vgi
   # feat/protocol-3.2-scan-planning 9cad6b9. The sweep skips the new files
   # (they need VGI_TEST_BRANCH_DIR); VgiScanPlanningTest covers that fixture.
-  VGI_REF: b3276d91fb2834578cbef437b1d62383fda3da32
+  VGI_REF: d4f849c8f7f2fe5dc194c51611d1340b8b2cae88
   # The Rust worker this connector's own test suite runs against (see
   # CLAUDE.md's "Test worker: vgi-rust, not vgi-python") — deliberately kept
   # floating on `main`, unlike the other three refs above: always build
