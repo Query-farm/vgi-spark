@@ -227,7 +227,7 @@ public final class VgiCatalog implements TableCatalog, SupportsNamespaces, Funct
             throw new NoSuchTableException(ident);
         }
         TableInfo info = TableInfoDecoder.decode(tableResp.items().get(0));
-        List<VgiBranch> branches = resolveBranches(schemaPath, tableName, atUnit, atValue);
+        List<VgiBranch> branches = resolveBranches(schemaPath, tableName, atUnit, atValue, info.scan_planning());
 
         // Native scan-function delegation (VgiNativeScanBranch's own javadoc):
         // a table that resolves to EXACTLY ONE native-delegating branch skips
@@ -272,13 +272,21 @@ public final class VgiCatalog implements TableCatalog, SupportsNamespaces, Funct
      * intercepts a single-native-branch result before ever constructing a
      * {@link VgiTable}.
      */
-    private List<VgiBranch> resolveBranches(List<String> schemaPath, String tableName, String atUnit, String atValue) {
+    private List<VgiBranch> resolveBranches(List<String> schemaPath, String tableName, String atUnit, String atValue,
+            String scanPlanning) {
         String schemaName = String.join(".", schemaPath);
         byte[] branchesResponse;
         try {
+            // pushdown_filters (the trailing argument, protocol 3.2) is always
+            // null: Spark resolves the Table -- including whether it becomes a
+            // Spark-native Parquet/CSV/Iceberg Table (VgiNativeScanResolver) --
+            // here in TableCatalog.loadTable, before any WHERE predicate
+            // exists. Null is always permitted, including for a
+            // scan_planning="filtered" table; Spark still applies every
+            // predicate to the rows the branches produce.
             branchesResponse = client.withConnection(a ->
                     a.service().catalog_table_scan_branches_get(
-                            a.handle(), schemaPath, tableName, atUnit, atValue, null, null));
+                            a.handle(), schemaPath, tableName, atUnit, atValue, null, null, null));
         } catch (MethodNotImplementedError notMultiBranch) {
             TableScanFunctionGetResponse scan = client.withConnection(a ->
                     a.service().catalog_table_scan_function_get(
@@ -329,16 +337,31 @@ public final class VgiCatalog implements TableCatalog, SupportsNamespaces, Funct
                         + " — only function and csv-format branches are supported");
             }
         }
-        if (branches.isEmpty()) {
-            // The table itself was already confirmed to exist (via
-            // catalog_table_get, above) — a worker declaring zero branches
-            // for it is an anomaly in the worker's own response, not "table
-            // not found," so this isn't NoSuchTableException (which is also
-            // a checked exception this private helper doesn't declare).
-            throw new IllegalStateException(
-                    "table '" + schemaName + "." + tableName + "': worker returned zero scan branches");
-        }
+        requireBranches(schemaName + "." + tableName, scanPlanning, branches.size());
         return branches;
+    }
+
+    /**
+     * Protocol 3.2's zero-branch rule: for a {@code scan_planning = "filtered"}
+     * table an empty {@code ScanBranchesResult} is legal and means the scan
+     * produces no rows ({@link VgiTable} with no branches plans zero input
+     * partitions). For a {@code "bind"} table it stays a protocol error.
+     *
+     * <p>The table itself was already confirmed to exist (via
+     * {@code catalog_table_get}), so a bind table with zero branches is an
+     * anomaly in the worker's response, not "table not found" — hence not
+     * {@code NoSuchTableException}.
+     *
+     * @param qualifiedName the table's {@code schema.table} name, for the error message
+     * @param scanPlanning  {@code TableInfo.scan_planning} ({@code null} reads as {@code "bind"})
+     * @param branchCount   how many branches the worker returned
+     * @throws IllegalStateException if a bind-time table returned zero branches
+     */
+    static void requireBranches(String qualifiedName, String scanPlanning, int branchCount) {
+        if (branchCount > 0 || TableInfo.SCAN_PLANNING_FILTERED.equals(scanPlanning)) return;
+        throw new IllegalStateException(
+                "table '" + qualifiedName + "': worker returned zero scan branches for a bind-time"
+                        + " (scan_planning=\"bind\") table");
     }
 
     @Override

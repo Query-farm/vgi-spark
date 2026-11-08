@@ -425,6 +425,33 @@ is a real risk this connector's existing test suite deliberately avoids
 live check above is a one-time manual verification, same as this section's
 own writeup.
 
+## Protocol 3.2 (vgi-spark 0.5.0, 2026-11-08)
+
+Built on `farm.query:vgi` 0.47.0 (protocol `vgi.v3` 3.2.0, exact major+minor
+matching, so a 3.2 connector refuses 3.1 workers and vice versa). The test
+worker (`vgi-rust`) must be a 3.2 build (vgi 0.50.0) too.
+
+- `VgiCatalog.resolveBranches` passes `pushdown_filters = null`. Sending real
+  predicates would mean deferring branch resolution from `loadTable` to
+  `VgiScanBuilder`, but `loadTable` already has to know the branches to decide
+  whether the table becomes a Spark-native Parquet/CSV/Iceberg `Table`
+  (`VgiNativeScanResolver`), and `VgiTable.supportsFilterPushdown` reads them
+  during `pushPredicates`. Doing it needs a wrapper `ScanBuilder` that
+  re-plans branches from the pushed predicates and forwards to a native
+  `ScanBuilder` — not attempted.
+- `VgiCatalog.requireBranches`: zero branches is an empty scan for a
+  `scan_planning = "filtered"` table, an error for a bind table.
+- `ScanBranch.row_count` / `column_statistics` are ignored (the local
+  `ScanBranchesDecoder` reads fields by name, so they decode harmlessly).
+- `VgiNativeScanResolver` accepts a list-of-files first argument for
+  `read_parquet`/`read_csv` (Spark's `paths` option).
+- `VgiScanPlanningTest` runs `data.planned_days` with `VGI_TEST_BRANCH_DIR`
+  set (new `VgiWorkerHarness.unix(dir, catalog, env)` overload) and checks the
+  worker's `last_plan.json` shows `received_filters: false`.
+  `data.planned_days_stats` (five native branches) is still refused by
+  `VgiScan` like any multi-branch native table, and `data.planned_days_bf`
+  by the existing `branch_filter` refusal.
+
 ## Open bugs (not yet fixed)
 
 - **`opt_time` / Arrow `Time(MICROSECOND)` has no Spark mapping.**

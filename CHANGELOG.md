@@ -6,6 +6,26 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.0] — unreleased
+
+### Changed
+
+- Protocol `vgi.v3` 3.2.0 (filtered scan planning), via `farm.query:vgi`
+  0.47.0. Clients and workers match on exact major and minor, so this release
+  attaches only to 3.2 workers; 3.1 workers need vgi-spark 0.4.x.
+- `catalog_table_scan_branches_get` now carries the trailing
+  `pushdown_filters` argument, always null: Spark resolves a table's branches
+  in `loadTable`, before predicates exist. A `scan_planning = "filtered"` table
+  is therefore planned once at load time and Spark applies every predicate.
+- A filtered table that returns zero branches is an empty scan (its declared
+  columns, no partitions); zero branches from a bind table stays an error.
+  `ScanBranch.row_count` / `column_statistics` are tolerated and ignored.
+
+### Added
+
+- Native `read_parquet` / `read_csv` delegation accepts a list of files as the
+  first argument, passed to Spark's file source as `paths`.
+
 ## [0.4.0] — 2026-11-05
 
 ### Added
@@ -73,6 +93,7 @@ follows [Semantic Versioning](https://semver.org/).
   `CLAUDE.md`'s own writeup for the full root cause (a raw Kotlin lambda
   Gradle's `CopySpec` silently doesn't resolve) and fix.
 
+[0.5.0]: https://github.com/Query-farm/vgi-spark/releases/tag/v0.5.0
 [0.4.0]: https://github.com/Query-farm/vgi-spark/releases/tag/v0.4.0
 [0.3.0]: https://github.com/Query-farm/vgi-spark/releases/tag/v0.3.0
 

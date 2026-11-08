@@ -121,12 +121,27 @@ public final class VgiWorkerHarness {
      *        VGI_WORKER_CATALOG_NAME}
      */
     public static Handle unix(File vgiRustDir, String catalogName) throws IOException {
+        return unix(vgiRustDir, catalogName, java.util.Map.of());
+    }
+
+    /**
+     * Same as {@link #unix(File, String)}, with extra worker environment
+     * variables — e.g. {@code VGI_TEST_BRANCH_DIR}, the directory the
+     * example worker's native-branch fixtures (the protocol 3.2 {@code
+     * data.planned_days*} tables) read their files from and write their
+     * {@code last_plan.json} to.
+     *
+     * @param extraEnv environment variables added to the worker process
+     */
+    public static Handle unix(File vgiRustDir, String catalogName, java.util.Map<String, String> extraEnv)
+            throws IOException {
         Path socketDir = Files.createTempDirectory("vgi-spark-unix-");
         Path socketPath = socketDir.resolve("w.sock");
         ProcessBuilder pb = new ProcessBuilder(workerBinary(vgiRustDir).toString(), "--unix", socketPath.toString())
                 .directory(vgiRustDir)
                 .redirectError(ProcessBuilder.Redirect.DISCARD);
         pb.environment().put("VGI_WORKER_CATALOG_NAME", catalogName);
+        pb.environment().putAll(extraEnv);
         Process worker = pb.start();
         awaitDiscoveryLine(worker, "UNIX:");
         return new Handle("unix://" + socketPath, () -> {

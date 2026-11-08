@@ -852,6 +852,12 @@ payoff, same shape as item 12's `CALL` work.
 arguments, no worker — real local-file round trips for `read_parquet`/`read_csv`, argument-validation
 and missing-Iceberg-jar coverage for all three targets).
 
+**Protocol 3.2 (0.5.0):** a FUNCTION branch's first argument may also be a list of files
+(`read_parquet([...])`, what the 3.2 `data.planned_days` fixture returns); `read_parquet`/`read_csv`
+pass it to Spark as the `paths` option. Filtered scan planning itself is not wired to Spark's
+predicates (branches are resolved in `loadTable`, `pushdown_filters` is always null), and
+`ScanBranch` statistics are not used for pruning — see `CLAUDE.md`'s "Protocol 3.2" section.
+
 ---
 
 ## Tier 3 — real gaps, lower payoff or higher uncertainty

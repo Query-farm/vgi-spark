@@ -5,7 +5,7 @@ plugins {
 
 allprojects {
     group = "farm.query"
-    version = "0.4.0"
+    version = "0.5.0"
 
     repositories {
         mavenCentral()
@@ -62,6 +62,10 @@ subprojects {
             "--add-opens=java.base/java.lang=ALL-UNNAMED",
             "--add-opens=java.base/java.util=ALL-UNNAMED",
             "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED",
+            // Spark's DATE literal handling (SparkDateTimeUtils, e.g. a
+            // pushed `event_date = DATE '...'` filter) reaches into
+            // sun.util.calendar.ZoneInfo; spark-submit opens it the same way.
+            "--add-opens=java.base/sun.util.calendar=ALL-UNNAMED",
             "--enable-native-access=ALL-UNNAMED",
         )
         maxHeapSize = "2g"

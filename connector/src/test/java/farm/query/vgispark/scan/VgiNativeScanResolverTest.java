@@ -70,6 +70,56 @@ class VgiNativeScanResolverTest {
         Assertions.assertEquals("id", table.columns()[0].name());
     }
 
+    private static ScanFunctionArguments.Decoded decodedList(List<String> paths) {
+        return new ScanFunctionArguments.Decoded(List.of(ScalarValue.of(paths)), Map.of());
+    }
+
+    /**
+     * {@code read_parquet(['a', 'b'])} — the list-of-files shape a worker
+     * publishing many files per table returns (e.g. the protocol 3.2
+     * {@code data.planned_days} fixture). Both paths must reach Spark: the
+     * resolved table sees every file's rows, and a missing second path fails
+     * the resolve instead of being silently dropped.
+     */
+    @Test
+    @Timeout(30)
+    void readParquetResolvesAListOfFiles() throws IOException {
+        startSpark("vgi-spark-native-scan-read-parquet-list");
+        Path dir = Files.createTempDirectory("vgi-native-scan-parquet-list");
+        String first = dir.resolve("first").toString();
+        String second = dir.resolve("second").toString();
+        spark.range(3).write().parquet(first);
+        spark.range(10, 14).write().parquet(second);
+
+        Table table = VgiNativeScanResolver.resolve("data.numbers",
+                new VgiNativeScanBranch("read_parquet", decodedList(List.of(first, second))), List.of(), false);
+        Assertions.assertEquals(1, table.columns().length);
+        Assertions.assertEquals("id", table.columns()[0].name());
+        Assertions.assertEquals(7L, spark.read().parquet(first, second).count());
+
+        String missing = dir.resolve("missing").toString();
+        Assertions.assertThrows(Exception.class, () -> VgiNativeScanResolver.resolve("data.numbers",
+                new VgiNativeScanBranch("read_parquet", decodedList(List.of(first, missing))), List.of(), false));
+    }
+
+    @Test
+    void emptyPathListIsRefused() {
+        VgiNativeScanBranch branch = new VgiNativeScanBranch("read_parquet",
+                new ScanFunctionArguments.Decoded(List.of(new ScalarValue(
+                        new org.apache.arrow.vector.types.pojo.ArrowType.List(), List.of())), Map.of()));
+        IllegalStateException e = Assertions.assertThrows(IllegalStateException.class,
+                () -> VgiNativeScanResolver.resolve("data.t", branch, List.of(), false));
+        Assertions.assertTrue(e.getMessage().contains("empty list"), e.getMessage());
+    }
+
+    @Test
+    void icebergScanRefusesAPathList() {
+        VgiNativeScanBranch branch = new VgiNativeScanBranch("iceberg_scan", decodedList(List.of("/a", "/b")));
+        IllegalStateException e = Assertions.assertThrows(IllegalStateException.class,
+                () -> VgiNativeScanResolver.resolve("data.t", branch, List.of(), false));
+        Assertions.assertTrue(e.getMessage().contains("expected a path"), e.getMessage());
+    }
+
     @Test
     @Timeout(30)
     void readCsvResolvesARealLocalFile() throws IOException {

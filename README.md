@@ -6,6 +6,25 @@ worker protocol the `vgi` DuckDB extension and
 [`vgi-trino`](https://github.com/Query-farm/vgi-trino) attach to. One Spark
 catalog maps to one VGI `ATTACH`, the same granularity DuckDB and Trino use.
 
+## Protocol 3.2 scan planning
+
+vgi-spark 0.5.0 speaks VGI protocol `vgi.v3` 3.2.0 (built on `farm.query:vgi`
+0.47.0). Protocol matching is exact on major and minor, so it attaches only to
+workers built with a 3.2 SDK; use vgi-spark 0.4.x for 3.1 workers.
+
+Spark resolves a catalog table's scan branches in `TableCatalog.loadTable`,
+before any `WHERE` predicate exists, so the connector always sends
+`catalog_table_scan_branches_get` with `pushdown_filters = null`, which the
+protocol permits for every table. A `scan_planning = "filtered"` table therefore
+returns all its branches and Spark applies the predicates to the rows. A
+filtered table that returns zero branches reads as an empty table; for a bind
+table zero branches is still an error. `ScanBranch.row_count` and
+`column_statistics` are decoded and ignored.
+
+A `read_parquet`/`read_csv` branch whose first argument is a list of files
+(the shape a filtered table publishing one file per partition returns) is
+handed to Spark's own reader as its `paths` option.
+
 ## Protocol 3.1 partition grouping
 
 When every VGI split advertises an exact protocol 3.1 `key_value`, the connector

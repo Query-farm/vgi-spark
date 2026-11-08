@@ -39,7 +39,7 @@ dependencies {
     // the protocol records, and the client.* pushdown/projection encoders. Built
     // from source via the composite build in ../settings.gradle.kts so this
     // module sees the table_function_plan client additions.
-    implementation("farm.query:vgi:0.46.0")
+    implementation("farm.query:vgi:0.47.0")
 
     // Iceberg's Spark integration — needed only for VgiNativeScanResolver's
     // iceberg_scan native-delegation handler (see that class's own javadoc).

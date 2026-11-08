@@ -126,7 +126,8 @@ public final class VgiNativeScanResolver {
      *        gate at all; refusing by default beats silently dropping it
      * @return Spark's own real {@link Table} for this delegation target
      * @throws IllegalStateException if {@code functionName} isn't a known
-     *         target, the arguments don't carry a usable path, an unmapped
+     *         target, the arguments don't carry a usable path (or, for the
+     *         file readers, a non-empty list of paths), an unmapped
      *         named argument was passed, {@code requiredFilters} is
      *         non-empty and unacknowledged, or the target's own runtime
      *         dependency (Iceberg) isn't on this Spark cluster's classpath
@@ -159,11 +160,7 @@ public final class VgiNativeScanResolver {
                     + " with no positional arguments (expected the file/glob/table path as argument 0)");
         }
         Object pathValue = args.positional().get(0).value();
-        if (!(pathValue instanceof String path)) {
-            throw new IllegalStateException(tableDisplayName + ": " + branch.functionName() + "'s first argument "
-                    + "is a " + (pathValue == null ? "null" : pathValue.getClass().getSimpleName())
-                    + ", expected a path/glob/table-location string");
-        }
+        List<String> paths = pathsOf(tableDisplayName, key, branch.functionName(), pathValue);
 
         Set<String> unknown = new TreeSet<>(args.named().keySet());
         unknown.removeAll(target.allowedNamedArgs());
@@ -174,7 +171,14 @@ public final class VgiNativeScanResolver {
         }
 
         Map<String, String> options = new LinkedHashMap<>();
-        options.put("path", path);
+        if (paths.size() == 1) {
+            options.put("path", paths.get(0));
+        } else {
+            // A list of files (DuckDB's read_parquet(['a', 'b'])) maps onto
+            // Spark's file-source "paths" option: a JSON string array, which
+            // FileDataSourceV2.getPaths decodes alongside "path".
+            options.put("paths", toJsonArray(paths));
+        }
         for (Map.Entry<String, ScalarValue> e : args.named().entrySet()) {
             if (e.getValue() == null || e.getValue().value() == null) continue;
             String[] translated = translateNamedArg(key, e.getKey(), String.valueOf(e.getValue().value()));
@@ -195,6 +199,44 @@ public final class VgiNativeScanResolver {
         StructType schema = provider.inferSchema(csMap);
         Transform[] partitioning = provider.inferPartitioning(csMap);
         return provider.getTable(schema, partitioning, csMap);
+    }
+
+    /**
+     * The path(s) a native reader's first positional argument names: one
+     * path/glob/location string, or — for the file readers ({@code
+     * read_parquet}/{@code read_csv}) — a non-empty list of them, the shape
+     * a worker that publishes many files per table (e.g. a protocol 3.2
+     * {@code scan_planning = "filtered"} table) returns.
+     */
+    static List<String> pathsOf(String tableDisplayName, String functionKey, String functionName, Object pathValue) {
+        if (pathValue instanceof String path) return List.of(path);
+        if (pathValue instanceof List<?> list && !"iceberg_scan".equals(functionKey)) {
+            if (list.isEmpty()) {
+                throw new IllegalStateException(tableDisplayName + ": " + functionName
+                        + "'s first argument is an empty list, expected at least one path");
+            }
+            List<String> out = new java.util.ArrayList<>(list.size());
+            for (Object item : list) {
+                if (item == null) {
+                    throw new IllegalStateException(tableDisplayName + ": " + functionName
+                            + "'s path list contains a null entry");
+                }
+                out.add(item.toString());
+            }
+            return List.copyOf(out);
+        }
+        throw new IllegalStateException(tableDisplayName + ": " + functionName + "'s first argument "
+                + "is a " + (pathValue == null ? "null" : pathValue.getClass().getSimpleName())
+                + ", expected a path/glob/table-location string"
+                + ("iceberg_scan".equals(functionKey) ? "" : " or a list of them"));
+    }
+
+    private static String toJsonArray(List<String> paths) {
+        try {
+            return new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString(paths);
+        } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
+            throw new IllegalStateException("could not encode native scan paths " + paths, e);
+        }
     }
 
     /**

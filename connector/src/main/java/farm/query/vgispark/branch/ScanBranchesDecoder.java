@@ -33,6 +33,15 @@ import java.util.Map;
  * {@code source_catalog: utf8?}, {@code source_schema: utf8?}, {@code source_table: utf8?},
  * {@code format_name: utf8?}, {@code format_locations: list&lt;utf8&gt;?},
  * {@code format_options: binary?}.
+ *
+ * <p>Fields are read by name, so the protocol 3.2 additions ({@code
+ * row_count: int64?}, {@code column_statistics: binary?}) decode without
+ * error and are deliberately not surfaced: vgi-spark resolves branches before
+ * Spark has any predicate to prune them against, and uses {@code
+ * TableInfo.cardinality_estimate} / {@code catalog_table_column_statistics_get}
+ * for Spark's optimizer instead. A result with zero branches decodes to an
+ * empty list; {@code VgiCatalog#requireBranches} decides whether that is legal
+ * for the table's {@code scan_planning} mode.
  */
 public final class ScanBranchesDecoder {
 
